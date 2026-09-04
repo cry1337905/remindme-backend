@@ -1,137 +1,82 @@
 import os
-from datetime import datetime, timedelta
-from typing import List, Optional
-
-from fastapi import Depends, FastAPI, HTTPException, status
+from typing import List, Dict, Optional
+from datetime import datetime
+from fastapi import FastAPI, HTTPException, Depends, status
 from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
-from jose import JWTError, jwt
 from pydantic import BaseModel
-from pwdlib import PasswordHash
-from pwdlib.hashers.bcrypt import BcryptHasher
-from sqlalchemy import Column, Integer, String, create_engine
-from sqlalchemy.orm import DeclarativeBase, Session, sessionmaker
+from passlib.context import CryptContext
+from jose import JWTError, jwt
 
 # ---------------------------------------------------------------------------
-# KONFIGURATION & DATENBANKVERBINDUNG (SUPABASE)
+# KONFIGURATION & SICHERHEIT
 # ---------------------------------------------------------------------------
-DATABASE_URL = os.getenv("DATABASE_URL")
-
-if not DATABASE_URL:
-    raise ValueError("DATABASE_URL Umweltvariable ist nicht gesetzt!")
-
-# Fix für Render / Supabase URL-Formate & SSL Mode
-db_url = DATABASE_URL.replace("postgres://", "postgresql://")
-if "sslmode" not in db_url and "localhost" not in db_url:
-    if "?" in db_url:
-        db_url += "&sslmode=require"
-    else:
-        db_url += "?sslmode=require"
-
-engine = create_engine(db_url, pool_pre_ping=True)
-SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
-
-# ---------------------------------------------------------------------------
-# JWT & PASSWORT HASHING
-# ---------------------------------------------------------------------------
-SECRET_KEY = os.getenv("SECRET_KEY", "remind_me_super_secret_jwt_key_1337")
+SECRET_KEY = os.getenv("SECRET_KEY", "remindme_super_secret_key_12345")
 ALGORITHM = "HS256"
-ACCESS_TOKEN_EXPIRE_MINUTES = 60 * 24  # Token 24 Stunden gültig
 
-password_hash = PasswordHash((BcryptHasher(),))
+pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="login")
 
+app = FastAPI(title="RemindMe Backend")
 
-def hash_password(password: str) -> str:
-    return password_hash.hash(password)
+# ---------------------------------------------------------------------------
+# IN-MEMORY DATENBANKEN (Für Tests/Prototyping - bei Bedarf durch SQLite/PostgreSQL ersetzen)
+# ---------------------------------------------------------------------------
+db_users: Dict[str, str] = {}  # username -> hashed_password
 
+db_tasks: List[dict] = []      # Liste aller Aufgaben-Dicts
+task_id_counter = 1
 
-def verify_password(plain_password: str, hashed_password: str) -> bool:
-    return password_hash.verify(plain_password, hashed_password)
+db_comments: Dict[str, List[dict]] = {}  # task_id -> Liste von Kommentaren
 
-
-def create_access_token(data: dict, expires_delta: Optional[timedelta] = None):
-    to_encode = data.copy()
-    expire = datetime.utcnow() + (
-        expires_delta or timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
-    )
-    to_encode.update({"exp": expire})
-    return jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
+# ZENTRALE GRUPPEN-DATENBANK (Neu)
+db_groups: Dict[str, List[str]] = {
+    "MTA (Maschinentechnische Abteilung)": ["Michael Klärner", "Daniel Lehmann"]
+}
 
 
 # ---------------------------------------------------------------------------
-# SQLALCHEMY MODELLE
+# PYDANTIC MODELLE
 # ---------------------------------------------------------------------------
-class Base(DeclarativeBase):
-    pass
-
-
-class UserDB(Base):
-    __tablename__ = "users"
-
-    id = Column(Integer, primary_key=True, index=True)
-    username = Column(String, unique=True, index=True, nullable=False)
-    hashed_password = Column(String, nullable=False)
-
-
-class TaskDB(Base):
-    __tablename__ = "tasks"
-
-    id = Column(Integer, primary_key=True, index=True)
-    title = Column(String, nullable=False)
-    description = Column(String, nullable=True)
-    created_by = Column(String, nullable=False)
-    assignee = Column(String, nullable=True)
-    deadline = Column(String, nullable=True)
-
-
-# Tabellen in Supabase automatisch anlegen falls sie fehlen
-Base.metadata.create_all(bind=engine)
-
-
-# ---------------------------------------------------------------------------
-# PYDANTIC SCHEMAS (API REQUEST / RESPONSE)
-# ---------------------------------------------------------------------------
-class UserCreate(BaseModel):
+class UserRegister(BaseModel):
     username: str
     password: str
-
 
 class TaskCreate(BaseModel):
     title: str
     description: Optional[str] = ""
-    assignee: Optional[str] = ""
+    assignee: Optional[str] = "Unassigned"
     deadline: Optional[str] = ""
 
+class TaskStatusUpdate(BaseModel):
+    status: str
 
-class TaskResponse(BaseModel):
-    id: int
-    title: str
-    description: Optional[str]
-    created_by: str
-    assignee: Optional[str]
-    deadline: Optional[str]
+class CommentCreate(BaseModel):
+    message: str
 
-    class Config:
-        from_attributes = True
+# Neues Modell für Gruppen
+class GroupModel(BaseModel):
+    name: str
+    members: List[str]
 
 
 # ---------------------------------------------------------------------------
-# DEPENDENCIES (DATENBANK & BENUTZER-AUTHENTIFIZIERUNG)
+# HELFER-FUNKTIONEN FOR AUTHENTIFIZIERUNG
 # ---------------------------------------------------------------------------
-def get_db():
-    db = SessionLocal()
-    try:
-        yield db
-    finally:
-        db.close()
+def verify_password(plain_password, hashed_password):
+    return pwd_context.verify(plain_password, hashed_password)
 
+def get_password_hash(password):
+    return pwd_context.hash(password)
 
-def get_current_user(
-    token: str = Depends(oauth2_scheme), db: Session = Depends(get_db)
-):
+def create_access_token(data: dict):
+    to_encode = data.copy()
+    token = jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
+    return token
+
+def get_current_user(token: str = Depends(oauth2_scheme)):
     credentials_exception = HTTPException(
         status_code=status.HTTP_401_UNAUTHORIZED,
-        detail="Token konnte nicht validiert werden.",
+        detail="Ungültige Anmeldedaten oder Sitzung abgelaufen.",
         headers={"WWW-Authenticate": "Bearer"},
     )
     try:
@@ -141,101 +86,123 @@ def get_current_user(
             raise credentials_exception
     except JWTError:
         raise credentials_exception
-
-    user = db.query(UserDB).filter(UserDB.username == username).first()
-    if user is None:
+    
+    if username not in db_users:
         raise credentials_exception
-    return user
+    return username
 
 
 # ---------------------------------------------------------------------------
-# FASTAPI ENDPUNKTE
+# BENUTZER-ENDPUNKTE (Login & Registrierung)
 # ---------------------------------------------------------------------------
-app = FastAPI(title="Remind Me =) Backend")
-
-
-@app.get("/")
-def root():
-    return {"status": "ok", "message": "Remind Me =) API läuft!"}
-
-
 @app.post("/register")
-def register(user: UserCreate, db: Session = Depends(get_db)):
-    db_user = db.query(UserDB).filter(UserDB.username == user.username).first()
-    if db_user:
-        raise HTTPException(
-            status_code=400, detail="Benutzername ist bereits vergeben."
-        )
-
-    # Passwort kürzen falls > 72 Zeichen (Bcrypt Limit)
-    safe_password = user.password[:72]
-    hashed_pw = hash_password(safe_password)
-
-    new_user = UserDB(username=user.username, hashed_password=hashed_pw)
-    db.add(new_user)
-    db.commit()
-    db.refresh(new_user)
+def register(user: UserRegister):
+    clean_user = user.username.strip()
+    if clean_user in db_users:
+        raise HTTPException(status_code=400, detail="Benutzername existiert bereits.")
+    
+    db_users[clean_user] = get_password_hash(user.password)
     return {"message": "Benutzer erfolgreich registriert."}
 
-
 @app.post("/login")
-def login(
-    form_data: OAuth2PasswordRequestForm = Depends(),
-    db: Session = Depends(get_db),
-):
-    user = db.query(UserDB).filter(UserDB.username == form_data.username).first()
-    if not user:
-        raise HTTPException(
-            status_code=400, detail="Ungültiger Benutzername oder Passwort."
-        )
-
-    safe_password = form_data.password[:72]
-    if not verify_password(safe_password, user.hashed_password):
-        raise HTTPException(
-            status_code=400, detail="Ungültiger Benutzername oder Passwort."
-        )
-
-    access_token = create_access_token(data={"sub": user.username})
+def login(form_data: OAuth2PasswordRequestForm = Depends()):
+    clean_user = form_data.username.strip()
+    hashed_pw = db_users.get(clean_user)
+    
+    if not hashed_pw or not verify_password(form_data.password, hashed_pw):
+        raise HTTPException(status_code=400, detail="Benutzername oder Passwort falsch.")
+    
+    access_token = create_access_token(data={"sub": clean_user})
     return {"access_token": access_token, "token_type": "bearer"}
 
 
-@app.get("/tasks", response_model=List[TaskResponse])
-def read_tasks(
-    current_user: UserDB = Depends(get_current_user),
-    db: Session = Depends(get_db),
-):
-    return db.query(TaskDB).all()
+# ---------------------------------------------------------------------------
+# GRUPPEN-ENDPUNKTE (NEU FUER ZENTRALE SPEICHERUNG)
+# ---------------------------------------------------------------------------
+@app.get("/groups")
+def get_groups(current_user: str = Depends(get_current_user)):
+    """Liefert alle gespeicherten Gruppen für alle eingeloggten Benutzer zurück."""
+    return db_groups
+
+@app.post("/groups")
+def save_group(group: GroupModel, current_user: str = Depends(get_current_user)):
+    """Speichert oder aktualisiert eine Gruppe zentral auf dem Server."""
+    clean_name = group.name.strip()
+    if not clean_name:
+        raise HTTPException(status_code=400, detail="Gruppenname darf nicht leer sein.")
+    
+    db_groups[clean_name] = group.members
+    return {"status": "ok", "message": f"Gruppe '{clean_name}' zentral gespeichert."}
 
 
-@app.post("/tasks", response_model=TaskResponse)
-def create_task(
-    task: TaskCreate,
-    current_user: UserDB = Depends(get_current_user),
-    db: Session = Depends(get_db),
-):
-    new_task = TaskDB(
-        title=task.title,
-        description=task.description,
-        created_by=current_user.username,
-        assignee=task.assignee,
-        deadline=task.deadline,
-    )
-    db.add(new_task)
-    db.commit()
-    db.refresh(new_task)
+# ---------------------------------------------------------------------------
+# AUFGABEN-ENDPUNKTE (Tasks)
+# ---------------------------------------------------------------------------
+@app.get("/tasks")
+def get_tasks(current_user: str = Depends(get_current_user)):
+    return db_tasks
+
+@app.post("/tasks")
+def create_task(task: TaskCreate, current_user: str = Depends(get_current_user)):
+    global task_id_counter
+    new_task = {
+        "id": task_id_counter,
+        "title": task.title,
+        "description": task.description,
+        "assignee": task.assignee,
+        "deadline": task.deadline,
+        "status": "Offen",
+        "created_by": current_user
+    }
+    db_tasks.append(new_task)
+    task_id_counter += 1
     return new_task
 
+@app.patch("/tasks/{task_id}/status")
+@app.put("/tasks/{task_id}")
+def update_task_status(task_id: int, status_update: TaskStatusUpdate, current_user: str = Depends(get_current_user)):
+    for task in db_tasks:
+        if task["id"] == task_id:
+            task["status"] = status_update.status
+            return task
+    raise HTTPException(status_code=404, detail="Aufgabe nicht gefunden.")
 
 @app.delete("/tasks/{task_id}")
-def delete_task(
-    task_id: int,
-    current_user: UserDB = Depends(get_current_user),
-    db: Session = Depends(get_db),
-):
-    task = db.query(TaskDB).filter(TaskDB.id == task_id).first()
-    if not task:
-        raise HTTPException(status_code=404, detail="Aufgabe nicht gefunden.")
+def delete_task(task_id: int, current_user: str = Depends(get_current_user)):
+    global db_tasks
+    for task in db_tasks:
+        if task["id"] == task_id:
+            if task["created_by"] != current_user:
+                raise HTTPException(status_code=403, detail="Nur der Ersteller darf diese Aufgabe löschen.")
+            
+            db_tasks = [t for t in db_tasks if t["id"] != task_id]
+            if str(task_id) in db_comments:
+                del db_comments[str(task_id)]
+            return {"message": "Aufgabe gelöscht."}
+            
+    raise HTTPException(status_code=404, detail="Aufgabe nicht gefunden.")
 
-    db.delete(task)
-    db.commit()
-    return {"message": f"Aufgabe {task_id} wurde gelöscht."}
+
+# ---------------------------------------------------------------------------
+# KOMMENTAR-ENDPUNKTE (Chat & Verlauf)
+# ---------------------------------------------------------------------------
+@app.get("/tasks/{task_id}/comments")
+def get_comments(task_id: str, current_user: str = Depends(get_current_user)):
+    return db_comments.get(str(task_id), [])
+
+@app.post("/tasks/{task_id}/comments")
+def add_comment(task_id: str, comment: CommentCreate, current_user: str = Depends(get_current_user)):
+    str_id = str(task_id)
+    now_str = datetime.now().strftime("%H:%M:%S")
+    
+    comment_entry = {
+        "author": current_user,
+        "message": comment.message,
+        "timestamp": now_str
+    }
+    
+    if str_id not in db_comments:
+        db_comments[str_id] = []
+        
+    db_comments[str_id].append(comment_entry)
+    return comment_entry
