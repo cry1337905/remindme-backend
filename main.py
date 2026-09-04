@@ -3,12 +3,12 @@ from datetime import datetime, timedelta
 from typing import List, Optional
 
 from fastapi import Depends, FastAPI, HTTPException, status
-from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForms
+from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
 from jose import JWTError, jwt
 from pydantic import BaseModel
 from pwdlib import PasswordHash
 from pwdlib.hashers.bcrypt import BcryptHasher
-from sqlalchemy import Column, DateTime, ForeignKey, Integer, String, create_engine
+from sqlalchemy import Column, Integer, String, create_engine
 from sqlalchemy.orm import DeclarativeBase, Session, sessionmaker
 
 # ---------------------------------------------------------------------------
@@ -142,9 +142,7 @@ def get_current_user(
     except JWTError:
         raise credentials_exception
 
-    user = (
-        db.query(UserDB).filter(UserDB.username == username).first()
-    )
+    user = db.query(UserDB).filter(UserDB.username == username).first()
     if user is None:
         raise credentials_exception
     return user
@@ -163,9 +161,7 @@ def root():
 
 @app.post("/register")
 def register(user: UserCreate, db: Session = Depends(get_db)):
-    db_user = (
-        db.query(UserDB).filter(UserDB.username == user.username).first()
-    )
+    db_user = db.query(UserDB).filter(UserDB.username == user.username).first()
     if db_user:
         raise HTTPException(
             status_code=400, detail="Benutzername ist bereits vergeben."
@@ -187,11 +183,7 @@ def login(
     form_data: OAuth2PasswordRequestForm = Depends(),
     db: Session = Depends(get_db),
 ):
-    user = (
-        db.query(UserDB)
-        .filter(UserDB.username == form_data.username)
-        .first()
-    )
+    user = db.query(UserDB).filter(UserDB.username == form_data.username).first()
     if not user:
         raise HTTPException(
             status_code=400, detail="Ungültiger Benutzername oder Passwort."
@@ -242,9 +234,7 @@ def delete_task(
 ):
     task = db.query(TaskDB).filter(TaskDB.id == task_id).first()
     if not task:
-        raise HTTPException(
-            status_code=404, detail="Aufgabe nicht gefunden."
-        )
+        raise HTTPException(status_code=404, detail="Aufgabe nicht gefunden.")
 
     db.delete(task)
     db.commit()
