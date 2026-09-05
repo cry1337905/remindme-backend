@@ -75,7 +75,7 @@ Base.metadata.create_all(bind=engine)
 
 
 # ---------------------------------------------------------------------------
-# SECURITY & AUTHENTIFIZIERUNG (Direkt via Bcrypt ohne Passlib)
+# SECURITY & AUTHENTIFIZIERUNG
 # ---------------------------------------------------------------------------
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="login")
 
@@ -90,7 +90,6 @@ def get_db():
 
 def get_password_hash(password: str) -> str:
     pwd_bytes = password.encode("utf-8")
-    # Bcrypt beschränkt Passwörter auf max. 72 Bytes
     if len(pwd_bytes) > 72:
         pwd_bytes = pwd_bytes[:72]
     salt = bcrypt.gensalt()
@@ -175,29 +174,12 @@ def register(user_data: UserCreate, db: Session = Depends(get_db)):
 
 @app.post("/login")
 def login(
-    form_data: Optional[OAuth2PasswordRequestForm] = Depends(),
-    json_data: Optional[dict] = Body(None),
+    form_data: OAuth2PasswordRequestForm = Depends(),
     db: Session = Depends(get_db)
 ):
-    # Unterstützt sowohl Form-Data als auch JSON-Payloads vom Client
-    username = None
-    password = None
-
-    if form_data and form_data.username:
-        username = form_data.username
-        password = form_data.password
-    elif json_data:
-        username = json_data.get("username")
-        password = json_data.get("password")
-
-    if not username or not password:
-        raise HTTPException(
-            status_code=400, detail="Benutzername und Passwort erforderlich."
-        )
-
-    user = db.query(UserDB).filter(UserDB.username == username).first()
+    user = db.query(UserDB).filter(UserDB.username == form_data.username).first()
     
-    if not user or not verify_password(password, user.hashed_password):
+    if not user or not verify_password(form_data.password, user.hashed_password):
         raise HTTPException(
             status_code=400, detail="Benutzername oder Passwort falsch."
         )
