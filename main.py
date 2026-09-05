@@ -2,9 +2,9 @@ import datetime
 import os
 from typing import List, Optional
 
-from fastapi import Depends, FastAPI, HTTPException, status
+import bcrypt
+from fastapi import Body, Depends, FastAPI, HTTPException, status
 from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
-from passlib.context import CryptContext
 from pydantic import BaseModel
 from sqlalchemy import Column, ForeignKey, Integer, String, Text, create_engine
 from sqlalchemy.ext.declarative import declarative_base
@@ -19,6 +19,10 @@ DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///./local_app.db")
 # Falls Supabase mit 'postgres://' startet, auf 'postgresql://' anpassen
 if DATABASE_URL.startswith("postgres://"):
     DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql://", 1)
+
+# Sonderzeichen im Passwort automatisch für SQLAlchemy maskieren (falls unmaskiert)
+if "!" in DATABASE_URL and "%21" not in DATABASE_URL:
+    DATABASE_URL = DATABASE_URL.replace("!", "%21")
 
 # SQLite benötigt connect_args, PostgreSQL/Supabase nutzt den Transaction Pooler (NullPool)
 if DATABASE_URL.startswith("sqlite"):
@@ -71,9 +75,8 @@ Base.metadata.create_all(bind=engine)
 
 
 # ---------------------------------------------------------------------------
-# SECURITY & AUTHENTIFIZIERUNG
+# SECURITY & AUTHENTIFIZIERUNG (Direkt via Bcrypt ohne Passlib)
 # ---------------------------------------------------------------------------
-pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="login")
 
 
@@ -85,16 +88,27 @@ def get_db():
         db.close()
 
 
-def verify_password(plain_password, hashed_password):
-    return pwd_context.verify(plain_password, hashed_password)
+def get_password_hash(password: str) -> str:
+    pwd_bytes = password.encode("utf-8")
+    # Bcrypt beschränkt Passwörter auf max. 72 Bytes
+    if len(pwd_bytes) > 72:
+        pwd_bytes = pwd_bytes[:72]
+    salt = bcrypt.gensalt()
+    return bcrypt.hashpw(pwd_bytes, salt).decode("utf-8")
 
 
-def get_password_hash(password):
-    return pwd_context.hash(password)
+def verify_password(plain_password: str, hashed_password: str) -> bool:
+    pwd_bytes = plain_password.encode("utf-8")
+    if len(pwd_bytes) > 72:
+        pwd_bytes = pwd_bytes[:72]
+    hash_bytes = hashed_password.encode("utf-8")
+    try:
+        return bcrypt.checkpw(pwd_bytes, hash_bytes)
+    except Exception:
+        return False
 
 
 def get_current_user(token: str = Depends(oauth2_scheme), db: Session = Depends(get_db)):
-    # Vereinfachter Token-Check (für Demo-/Schulungszwecke wird der Username als Token genutzt)
     user = db.query(UserDB).filter(UserDB.username == token).first()
     if not user:
         raise HTTPException(
@@ -134,7 +148,7 @@ class GroupCreate(BaseModel):
 
 
 # ---------------------------------------------------------------------------
-# FASTAPI APP
+# FASTAPI APP & ENDPUNKTE
 # ---------------------------------------------------------------------------
 app = FastAPI(title="Remind Me Backend")
 
@@ -160,12 +174,34 @@ def register(user_data: UserCreate, db: Session = Depends(get_db)):
 
 
 @app.post("/login")
-def login(form_data: OAuth2PasswordRequestForm = Depends(), db: Session = Depends(get_db)):
-    user = db.query(UserDB).filter(UserDB.username == form_data.username).first()
-    if not user or not verify_password(form_data.password, user.hashed_password):
+def login(
+    form_data: Optional[OAuth2PasswordRequestForm] = Depends(),
+    json_data: Optional[dict] = Body(None),
+    db: Session = Depends(get_db)
+):
+    # Unterstützt sowohl Form-Data als auch JSON-Payloads vom Client
+    username = None
+    password = None
+
+    if form_data and form_data.username:
+        username = form_data.username
+        password = form_data.password
+    elif json_data:
+        username = json_data.get("username")
+        password = json_data.get("password")
+
+    if not username or not password:
+        raise HTTPException(
+            status_code=400, detail="Benutzername und Passwort erforderlich."
+        )
+
+    user = db.query(UserDB).filter(UserDB.username == username).first()
+    
+    if not user or not verify_password(password, user.hashed_password):
         raise HTTPException(
             status_code=400, detail="Benutzername oder Passwort falsch."
         )
+
     return {"access_token": user.username, "token_type": "bearer"}
 
 
@@ -246,7 +282,6 @@ def add_comment(task_id: int, comment_data: CommentCreate, current_user: str = D
     raw_message = comment_data.message
     timestamp_str = ""
 
-    # Zeitstempel parsen falls vorhanden
     if raw_message.startswith("__TIME__:"):
         parts = raw_message.split("\n", 1)
         timestamp_str = parts[0].replace("__TIME__:", "").strip()
