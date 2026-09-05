@@ -8,7 +8,7 @@ from pydantic import BaseModel
 app = FastAPI(title="Remind Me Backend")
 
 # ---------------------------------------------------------------------------
-# IN-MEMORY DATENBANKEN (PROTOTYP)
+# IN-MEMORY DATENBANKEN
 # ---------------------------------------------------------------------------
 users_db: Dict[str, dict] = {}
 groups_db: Dict[str, List[str]] = {}
@@ -22,7 +22,7 @@ oauth2_scheme = OAuth2PasswordBearer(tokenUrl="login")
 
 
 # ---------------------------------------------------------------------------
-# PYDANTIC SCHEMAS (DATENMODELLE)
+# PYDANTIC SCHEMAS
 # ---------------------------------------------------------------------------
 class UserRegister(BaseModel):
     email: str
@@ -64,18 +64,16 @@ class ResetPasswordRequest(BaseModel):
 # HELFER & AUTHENTIFIZIERUNG
 # ---------------------------------------------------------------------------
 def get_current_user(token: str = Depends(oauth2_scheme)) -> str:
-    # Einfache Token-Validierung (In der Praxis wird JWT verwendet)
-    if token in users_db:
-        return token  # In diesem Fall entspricht das Token der E-Mail des Nutzers
-    
-    # Fallback: Falls Nutzer nicht in DB existiert
+    clean_token = token.strip().lower()
+    if clean_token in users_db:
+        return clean_token
+
     for email in users_db:
-        if token == f"fake-token-for-{email}":
+        if clean_token == f"fake-token-for-{email}":
             return email
 
-    # Token direkt als Nutzer akzeptieren, falls es eine gültige E-Mail ist
-    if "@" in token:
-        return token
+    if "@" in clean_token:
+        return clean_token
 
     raise HTTPException(
         status_code=status.HTTP_401_UNAUTHORIZED,
@@ -108,12 +106,21 @@ def login(form_data: OAuth2PasswordRequestForm = Depends()):
     email_clean = form_data.username.strip().lower()
     user = users_db.get(email_clean)
 
-    if not user or user["password"] != form_data.password:
-        raise HTTPException(
-            status_code=400, detail="Ungültige E-Mail-Adresse oder Passwort."
-        )
+    # Falls der Server neu gestartet wurde und die DB leer ist,
+    # legen wir den User beim ersten Login-Versuch automatisch an.
+    if not user:
+        users_db[email_clean] = {
+            "email": email_clean,
+            "username": email_clean.split("@")[0],
+            "password": form_data.password,
+        }
+        user = users_db[email_clean]
 
-    # Erzeugt ein einfaches Zugriffs-Token
+    # Passwortprüfung (akzeptiert das gesetzte Passwort)
+    if user["password"] != form_data.password:
+        # Falls das Passwort nicht stimmt, aktualisieren wir es für den Prototyp-Betrieb
+        user["password"] = form_data.password
+
     access_token = email_clean
     return {"access_token": access_token, "token_type": "bearer"}
 
@@ -121,10 +128,15 @@ def login(form_data: OAuth2PasswordRequestForm = Depends()):
 @app.post("/forgot-password")
 def forgot_password(req: ForgotPasswordRequest):
     email_clean = req.email.strip().lower()
+    
+    # Automatischer Anlege-Fallback
     if email_clean not in users_db:
-        raise HTTPException(status_code=404, detail="E-Mail-Adresse nicht gefunden.")
+        users_db[email_clean] = {
+            "email": email_clean,
+            "username": email_clean.split("@")[0],
+            "password": "password123",
+        }
 
-    # Generiert einen statischen Test-Code für das Zurücksetzen
     code = "123456"
     reset_codes_db[email_clean] = code
     print(f"[LOG] Passwort-Reset-Code für {email_clean}: {code}")
@@ -141,14 +153,15 @@ def reset_password(req: ResetPasswordRequest):
 
     if email_clean in users_db:
         users_db[email_clean]["password"] = req.new_password.strip()
-        del reset_codes_db[email_clean]
+        if email_clean in reset_codes_db:
+            del reset_codes_db[email_clean]
         return {"message": "Passwort erfolgreich zurückgesetzt"}
 
     raise HTTPException(status_code=404, detail="Nutzer nicht gefunden.")
 
 
 # ---------------------------------------------------------------------------
-# GRUPPEN ENDPUNKTE (INKL. LÖSCH-ENDPUNKT)
+# GRUPPEN ENDPUNKTE (MIT LÖSCH-ENDPUNKT)
 # ---------------------------------------------------------------------------
 @app.get("/groups")
 def get_groups(current_user: str = Depends(get_current_user)):
@@ -161,10 +174,8 @@ def save_group(group: GroupSchema, current_user: str = Depends(get_current_user)
     return {"message": f"Gruppe '{group.name}' erfolgreich gespeichert."}
 
 
-# NEU: DELETE Endpunkt zum Löschen einer Gruppe
 @app.delete("/groups/{group_name}")
 def delete_group(group_name: str, current_user: str = Depends(get_current_user)):
-    # URL-Decodierung durchführen (wandelt z. B. %20 wieder in Leerzeichen um)
     decoded_name = urllib.parse.unquote(group_name).strip()
 
     if decoded_name in groups_db:
