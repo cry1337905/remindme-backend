@@ -1,10 +1,9 @@
 import datetime
+import json
 import os
 import random
-import smtplib
 import urllib.parse
-from email.mime.multipart import MIMEMultipart
-from email.mime.text import MIMEText
+import urllib.request
 from typing import Dict, List, Optional
 from fastapi import Depends, FastAPI, HTTPException, status
 from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
@@ -13,46 +12,50 @@ from pydantic import BaseModel
 app = FastAPI(title="Remind Me Backend")
 
 # ---------------------------------------------------------------------------
-# BREVO E-MAIL KONFIGURATION (Sicher über Umgebungsvariablen geladen)
+# BREVO E-MAIL KONFIGURATION (API-basiert, umgeht SMTP-Port-Sperren)
 # ---------------------------------------------------------------------------
-SMTP_SERVER = os.getenv("SMTP_SERVER", "smtp-relay.brevo.com")
-SMTP_PORT = int(os.getenv("SMTP_PORT", 587))
-SMTP_USER = os.getenv("SMTP_USER", "")
 SMTP_PASSWORD = os.getenv("SMTP_PASSWORD", "")
-SENDER_EMAIL = os.getenv("SENDER_EMAIL", SMTP_USER)
+SENDER_EMAIL = os.getenv("SENDER_EMAIL", os.getenv("SMTP_USER", ""))
 
 
 def send_reset_email(to_email: str, code: str) -> bool:
-    """Sendet eine E-Mail mit dem Passwort-Reset-Code via Brevo SMTP."""
-    if not SMTP_USER or not SMTP_PASSWORD:
-        print("[WARNUNG] E-Mail-Zugangsdaten sind nicht in den Umgebungsvariablen gesetzt!")
+    """Sendet eine E-Mail direkt über die Brevo HTTP API (umgeht SMTP-Port-Sperren auf Render)."""
+    if not SMTP_PASSWORD:
+        print("[WARNUNG] E-Mail-Zugangsdaten (SMTP_PASSWORD) sind nicht in den Umgebungsvariablen gesetzt!")
         return False
 
-    msg = MIMEMultipart()
-    msg["From"] = f"RemindMe App <{SENDER_EMAIL}>"
-    msg["To"] = to_email
-    msg["Subject"] = "Dein Passwort-Reset-Code"
+    url = "https://api.brevo.com/v3/smtp/email"
 
-    body = (
-        f"Hallo,\n\n"
-        f"dein Sicherheitscode zum Zurücksetzen des Passports lautet:\n\n"
-        f"   {code}\n\n"
-        f"Falls du dies nicht angefordert hast, kannst du diese E-Mail einfach ignorieren.\n\n"
-        f"Viele Grüße,\n"
-        f"Dein RemindMe Team"
-    )
-    msg.attach(MIMEText(body, "plain", "utf-8"))
+    headers = {
+        "accept": "application/json",
+        "api-key": SMTP_PASSWORD,
+        "content-type": "application/json",
+    }
+
+    payload = {
+        "sender": {"name": "RemindMe App", "email": SENDER_EMAIL},
+        "to": [{"email": to_email}],
+        "subject": "Dein Passwort-Reset-Code",
+        "textContent": (
+            f"Hallo,\n\n"
+            f"dein Sicherheitscode zum Zurücksetzen des Passports lautet:\n\n"
+            f"   {code}\n\n"
+            f"Falls du dies nicht angefordert hast, kannst du diese E-Mail einfach ignorieren.\n\n"
+            f"Viele Grüße,\n"
+            f"Dein RemindMe Team"
+        ),
+    }
 
     try:
-        server = smtplib.SMTP(SMTP_SERVER, SMTP_PORT, timeout=10)
-        server.starttls()
-        server.login(SMTP_USER, SMTP_PASSWORD)
-        server.send_message(msg)
-        server.quit()
-        print(f"[LOG] E-Mail erfolgreich an {to_email} gesendet.")
-        return True
+        req = urllib.request.Request(
+            url, data=json.dumps(payload).encode("utf-8"), headers=headers
+        )
+        with urllib.request.urlopen(req, timeout=10) as response:
+            if response.status in (200, 201):
+                print(f"[LOG] E-Mail erfolgreich an {to_email} gesendet.")
+                return True
     except Exception as e:
-        print(f"[FEHLER] E-Mail konnte nicht gesendet werden: {e}")
+        print(f"[FEHLER] E-Mail konnte nicht via API gesendet werden: {e}")
         return False
 
 
@@ -181,11 +184,11 @@ def forgot_password(req: ForgotPasswordRequest):
             "password": "password123",
         }
 
-    # Generiert einen echten zufälligen 6-stelligen Code
+    # Generiert einen zufälligen 6-stelligen Code
     code = f"{random.randint(100000, 999999)}"
     reset_codes_db[email_clean] = code
 
-    # Versendet die E-Mail
+    # Versendet die E-Mail via HTTP API
     email_sent = send_reset_email(email_clean, code)
 
     if not email_sent:
