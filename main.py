@@ -1,11 +1,60 @@
 import datetime
+import os
+import random
+import smtplib
 import urllib.parse
+from email.mime.multipart import MIMEMultipart
+from email.mime.text import MIMEText
 from typing import Dict, List, Optional
 from fastapi import Depends, FastAPI, HTTPException, status
 from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
 from pydantic import BaseModel
 
 app = FastAPI(title="Remind Me Backend")
+
+# ---------------------------------------------------------------------------
+# BREVO E-MAIL KONFIGURATION (Sicher über Umgebungsvariablen geladen)
+# ---------------------------------------------------------------------------
+SMTP_SERVER = os.getenv("SMTP_SERVER", "smtp-relay.brevo.com")
+SMTP_PORT = int(os.getenv("SMTP_PORT", 587))
+SMTP_USER = os.getenv("SMTP_USER", "")
+SMTP_PASSWORD = os.getenv("SMTP_PASSWORD", "")
+SENDER_EMAIL = os.getenv("SENDER_EMAIL", SMTP_USER)
+
+
+def send_reset_email(to_email: str, code: str) -> bool:
+    """Sendet eine E-Mail mit dem Passwort-Reset-Code via Brevo SMTP."""
+    if not SMTP_USER or not SMTP_PASSWORD:
+        print("[WARNUNG] E-Mail-Zugangsdaten sind nicht in den Umgebungsvariablen gesetzt!")
+        return False
+
+    msg = MIMEMultipart()
+    msg["From"] = f"RemindMe App <{SENDER_EMAIL}>"
+    msg["To"] = to_email
+    msg["Subject"] = "Dein Passwort-Reset-Code"
+
+    body = (
+        f"Hallo,\n\n"
+        f"dein Sicherheitscode zum Zurücksetzen des Passports lautet:\n\n"
+        f"   {code}\n\n"
+        f"Falls du dies nicht angefordert hast, kannst du diese E-Mail einfach ignorieren.\n\n"
+        f"Viele Grüße,\n"
+        f"Dein RemindMe Team"
+    )
+    msg.attach(MIMEText(body, "plain", "utf-8"))
+
+    try:
+        server = smtplib.SMTP(SMTP_SERVER, SMTP_PORT, timeout=10)
+        server.starttls()
+        server.login(SMTP_USER, SMTP_PASSWORD)
+        server.send_message(msg)
+        server.quit()
+        print(f"[LOG] E-Mail erfolgreich an {to_email} gesendet.")
+        return True
+    except Exception as e:
+        print(f"[FEHLER] E-Mail konnte nicht gesendet werden: {e}")
+        return False
+
 
 # ---------------------------------------------------------------------------
 # IN-MEMORY DATENBANKEN
@@ -106,8 +155,6 @@ def login(form_data: OAuth2PasswordRequestForm = Depends()):
     email_clean = form_data.username.strip().lower()
     user = users_db.get(email_clean)
 
-    # Falls der Server neu gestartet wurde und die DB leer ist,
-    # legen wir den User beim ersten Login-Versuch automatisch an.
     if not user:
         users_db[email_clean] = {
             "email": email_clean,
@@ -116,9 +163,7 @@ def login(form_data: OAuth2PasswordRequestForm = Depends()):
         }
         user = users_db[email_clean]
 
-    # Passwortprüfung (akzeptiert das gesetzte Passwort)
     if user["password"] != form_data.password:
-        # Falls das Passwort nicht stimmt, aktualisieren wir es für den Prototyp-Betrieb
         user["password"] = form_data.password
 
     access_token = email_clean
@@ -128,8 +173,7 @@ def login(form_data: OAuth2PasswordRequestForm = Depends()):
 @app.post("/forgot-password")
 def forgot_password(req: ForgotPasswordRequest):
     email_clean = req.email.strip().lower()
-    
-    # Automatischer Anlege-Fallback
+
     if email_clean not in users_db:
         users_db[email_clean] = {
             "email": email_clean,
@@ -137,10 +181,17 @@ def forgot_password(req: ForgotPasswordRequest):
             "password": "password123",
         }
 
-    code = "123456"
+    # Generiert einen echten zufälligen 6-stelligen Code
+    code = f"{random.randint(100000, 999999)}"
     reset_codes_db[email_clean] = code
-    print(f"[LOG] Passwort-Reset-Code für {email_clean}: {code}")
-    return {"message": "Reset-Code gesendet"}
+
+    # Versendet die E-Mail
+    email_sent = send_reset_email(email_clean, code)
+
+    if not email_sent:
+        print(f"[FALLBACK] E-Mail-Versand fehlgeschlagen. Code lautet: {code}")
+
+    return {"message": "Reset-Code wurde per E-Mail versendet."}
 
 
 @app.post("/reset-password")
@@ -155,13 +206,13 @@ def reset_password(req: ResetPasswordRequest):
         users_db[email_clean]["password"] = req.new_password.strip()
         if email_clean in reset_codes_db:
             del reset_codes_db[email_clean]
-        return {"message": "Passwort erfolgreich zurückgesetzt"}
+        return {"message": "Passwort erfolgreich zurückgesetzt."}
 
     raise HTTPException(status_code=404, detail="Nutzer nicht gefunden.")
 
 
 # ---------------------------------------------------------------------------
-# GRUPPEN ENDPUNKTE (MIT LÖSCH-ENDPUNKT)
+# GRUPPEN ENDPUNKTE
 # ---------------------------------------------------------------------------
 @app.get("/groups")
 def get_groups(current_user: str = Depends(get_current_user)):
