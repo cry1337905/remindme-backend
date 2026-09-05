@@ -6,23 +6,27 @@ from typing import List, Optional
 from fastapi import FastAPI, HTTPException, Depends, Header, status
 from pydantic import BaseModel, EmailStr
 from supabase import create_client, Client
+from postgrest.exceptions import APIError
 
-# ---------------------------------------------------------------------------
-# INITIALISIERUNG & SUPABASE CLIENT
-# ---------------------------------------------------------------------------
 SUPABASE_URL = os.environ.get("SUPABASE_URL")
 SUPABASE_KEY = os.environ.get("SUPABASE_KEY")
 
 if not SUPABASE_URL or not SUPABASE_KEY:
-    raise RuntimeError("SUPABASE_URL und SUPABASE_KEY müssen als Umgebungsvariablen gesetzt sein.")
+    raise RuntimeError("SUPABASE_URL und SUPABASE_KEY müssen gesetzt sein.")
 
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 
 app = FastAPI(title="RemindMe Backend")
 
+# ---------------------------------------------------------------------------
+# HEALTH CHECK (Behebt 404 Fehler auf Render)
+# ---------------------------------------------------------------------------
+@app.get("/")
+def health_check():
+    return {"status": "ok", "message": "RemindMe API läuft"}
 
 # ---------------------------------------------------------------------------
-# SCHEMAS (DATENMODELLE)
+# SCHEMAS
 # ---------------------------------------------------------------------------
 class RegisterSchema(BaseModel):
     email: EmailStr
@@ -55,7 +59,6 @@ class ResetPasswordSchema(BaseModel):
     code: str
     new_password: str
 
-
 # ---------------------------------------------------------------------------
 # HELFERFUNKTIONEN
 # ---------------------------------------------------------------------------
@@ -78,8 +81,6 @@ def get_current_user(authorization: Optional[str] = Header(None)) -> dict:
             raise HTTPException(status_code=401, detail="Sitzung abgelaufen oder ungültig")
         
         user_id = user_res.user.id
-        
-        # Benutzerprofil aus public.users abrufen
         profile_res = supabase.table("users").select("*").eq("id", user_id).execute()
         if not profile_res.data:
             raise HTTPException(status_code=404, detail="Benutzerprofil nicht gefunden")
@@ -91,14 +92,13 @@ def get_current_user(authorization: Optional[str] = Header(None)) -> dict:
             detail=f"Authentifizierungsfehler: {str(e)}",
         )
 
-
 # ---------------------------------------------------------------------------
-# AUTHENTIFIZIERUNG & REGISTRIERUNG
+# REGISTRIERUNG (MIT DETALLIERTER FEHLERMELDUNG)
 # ---------------------------------------------------------------------------
 @app.post("/register")
 def register(data: RegisterSchema):
     try:
-        # 1. Supabase Auth Benutzer erstellen (Passwort wird nur hier verarbeitet)
+        # 1. Supabase Auth Benutzer erstellen
         auth_res = supabase.auth.sign_up({
             "email": data.email,
             "password": data.password
@@ -139,7 +139,7 @@ def register(data: RegisterSchema):
                 detail="Bitte gib entweder einen Firmennamen zum Gründen oder einen Firmen-Code zum Beitritt an."
             )
 
-        # 3. Profil in public.users speichern (OHNE password-Feld!)
+        # 3. Profil in public.users speichern
         supabase.table("users").insert({
             "id": user_id,
             "email": data.email,
@@ -152,15 +152,21 @@ def register(data: RegisterSchema):
             "company_code": assigned_code
         }
 
+    except APIError as api_err:
+        print(f"DATABASE ERROR: {api_err}")
+        raise HTTPException(status_code=400, detail=f"Datenbankfehler: {api_err.message}")
     except HTTPException as http_e:
         raise http_e
     except Exception as e:
+        print(f"INTERNAL ERROR: {str(e)}")
         raise HTTPException(status_code=500, detail=f"Interner Serverfehler: {str(e)}")
 
-
+# ---------------------------------------------------------------------------
+# LOGIN & PASSWORT RESET
+# ---------------------------------------------------------------------------
 @app.post("/login")
 def login(data: dict):
-    username = data.get("username")  # E-Mail
+    username = data.get("username")
     password = data.get("password")
 
     if not username or not password:
@@ -178,7 +184,6 @@ def login(data: dict):
     except Exception as e:
         raise HTTPException(status_code=400, detail="Anmeldung fehlgeschlagen. E-Mail oder Passwort falsch.")
 
-
 @app.post("/forgot-password")
 def forgot_password(data: ForgotPasswordSchema):
     try:
@@ -186,7 +191,6 @@ def forgot_password(data: ForgotPasswordSchema):
         return {"message": "Passwort-Zurücksetzen-Code gesendet."}
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
-
 
 @app.post("/reset-password")
 def reset_password(data: ResetPasswordSchema):
@@ -203,16 +207,14 @@ def reset_password(data: ResetPasswordSchema):
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"Fehler beim Zurücksetzen: {str(e)}")
 
-
 # ---------------------------------------------------------------------------
-# TASKS (AUFGABEN)
+# TASKS, COMMENTS & GROUPS
 # ---------------------------------------------------------------------------
 @app.get("/tasks")
 def get_tasks(current_user: dict = Depends(get_current_user)):
     company_id = current_user.get("company_id")
     res = supabase.table("tasks").select("*").eq("company_id", company_id).execute()
     return res.data or []
-
 
 @app.post("/tasks")
 def create_task(data: TaskSchema, current_user: dict = Depends(get_current_user)):
@@ -234,7 +236,6 @@ def create_task(data: TaskSchema, current_user: dict = Depends(get_current_user)
         return res.data[0]
     raise HTTPException(status_code=500, detail="Aufgabe konnte nicht erstellt werden.")
 
-
 @app.patch("/tasks/{task_id}/status")
 @app.put("/tasks/{task_id}")
 def update_task_status(task_id: str, data: StatusUpdateSchema, current_user: dict = Depends(get_current_user)):
@@ -244,22 +245,16 @@ def update_task_status(task_id: str, data: StatusUpdateSchema, current_user: dic
         return res.data[0]
     raise HTTPException(status_code=404, detail="Aufgabe nicht gefunden oder keine Berechtigung.")
 
-
 @app.delete("/tasks/{task_id}")
 def delete_task(task_id: str, current_user: dict = Depends(get_current_user)):
     company_id = current_user.get("company_id")
     res = supabase.table("tasks").delete().eq("id", task_id).eq("company_id", company_id).execute()
     return {"message": "Aufgabe gelöscht."}
 
-
-# ---------------------------------------------------------------------------
-# KOMMENTARE & CHAT
-# ---------------------------------------------------------------------------
 @app.get("/tasks/{task_id}/comments")
 def get_comments(task_id: str, current_user: dict = Depends(get_current_user)):
     res = supabase.table("comments").select("*").eq("task_id", task_id).order("created_at", desc=False).execute()
     return res.data or []
-
 
 @app.post("/tasks/{task_id}/comments")
 def add_comment(task_id: str, data: CommentSchema, current_user: dict = Depends(get_current_user)):
@@ -274,10 +269,6 @@ def add_comment(task_id: str, data: CommentSchema, current_user: dict = Depends(
         return res.data[0]
     raise HTTPException(status_code=500, detail="Kommentar konnte nicht gespeichert werden.")
 
-
-# ---------------------------------------------------------------------------
-# GRUPPEN
-# ---------------------------------------------------------------------------
 @app.get("/groups")
 def get_groups(current_user: dict = Depends(get_current_user)):
     company_id = current_user.get("company_id")
@@ -288,7 +279,6 @@ def get_groups(current_user: dict = Depends(get_current_user)):
         for item in res.data:
             groups_dict[item["name"]] = item.get("members", [])
     return groups_dict
-
 
 @app.post("/groups")
 def save_group(data: GroupSchema, current_user: dict = Depends(get_current_user)):
@@ -306,7 +296,6 @@ def save_group(data: GroupSchema, current_user: dict = Depends(get_current_user)
         }).execute()
 
     return {"message": f"Gruppe '{data.name}' gespeichert."}
-
 
 @app.delete("/groups/{group_name}")
 @app.delete("/groups")
