@@ -7,6 +7,7 @@ from fastapi import FastAPI, HTTPException, Depends, Header, status
 from pydantic import BaseModel, EmailStr
 from supabase import create_client, Client
 from postgrest.exceptions import APIError
+from gotrue.errors import AuthApiError
 
 # ---------------------------------------------------------------------------
 # INITIALISIERUNG & SUPABASE CLIENT
@@ -86,7 +87,8 @@ def get_current_user(authorization: Optional[str] = Header(None)) -> dict:
         if not user_res.user:
             raise HTTPException(status_code=401, detail="Sitzung abgelaufen oder ungültig")
         
-        user_id = getattr(user_res.user, "id", None) or user_res.user.get("id")
+        user_obj = user_res.user
+        user_id = getattr(user_obj, "id", None) if not isinstance(user_obj, dict) else user_obj.get("id")
         
         profile_res = supabase.table("users").select("*").eq("id", user_id).execute()
         if not profile_res.data:
@@ -112,13 +114,11 @@ def register(data: RegisterSchema):
             "password": data.password
         })
         
-        if not auth_res.user:
+        if not auth_res or not auth_res.user:
             raise HTTPException(status_code=400, detail="Registrierung im Auth-System fehlgeschlagen.")
             
-        # Sicheres Auslesen der User ID (funktioniert als Objekt und als Dict)
-        user_id = getattr(auth_res.user, "id", None)
-        if not user_id and isinstance(auth_res.user, dict):
-            user_id = auth_res.user.get("id")
+        user_obj = auth_res.user
+        user_id = getattr(user_obj, "id", None) if not isinstance(user_obj, dict) else user_obj.get("id")
 
         if not user_id:
             raise HTTPException(status_code=500, detail="User-ID konnte nicht aus dem Auth-System ausgelesen werden.")
@@ -130,20 +130,17 @@ def register(data: RegisterSchema):
         if data.company_name and data.company_name.strip():
             assigned_code = generate_company_code()
             
-            comp_res = supabase.table("companies").insert({
+            supabase.table("companies").insert({
                 "name": data.company_name.strip(),
                 "code": assigned_code
             }).execute()
             
-            # Falls insert() keine Daten zurückgibt, Abfrage per Code ausführen
-            if comp_res.data and len(comp_res.data) > 0:
-                company_id = comp_res.data[0]["id"]
+            # Über Code die ID nachladen (sicherer gegen RLS-Rückgabe-Filterung)
+            comp_fetch = supabase.table("companies").select("id, code").eq("code", assigned_code).execute()
+            if comp_fetch.data and len(comp_fetch.data) > 0:
+                company_id = comp_fetch.data[0]["id"]
             else:
-                fetch_comp = supabase.table("companies").select("id").eq("code", assigned_code).execute()
-                if fetch_comp.data and len(fetch_comp.data) > 0:
-                    company_id = fetch_comp.data[0]["id"]
-                else:
-                    raise HTTPException(status_code=500, detail="Firma konnte in der Datenbank nicht gefunden werden.")
+                raise HTTPException(status_code=500, detail="Firma konnte nach der Erstellung nicht in der Datenbank gefunden werden.")
 
         elif data.company_code and data.company_code.strip():
             code_clean = data.company_code.strip().upper()
@@ -173,6 +170,9 @@ def register(data: RegisterSchema):
             "company_code": assigned_code
         }
 
+    except AuthApiError as auth_err:
+        print(f"AUTH ERROR: {auth_err.message}")
+        raise HTTPException(status_code=400, detail=f"Registrierungsfehler: {auth_err.message}")
     except APIError as api_err:
         print(f"DATABASE ERROR: {api_err}")
         raise HTTPException(status_code=400, detail=f"Datenbankfehler: {api_err.message}")
