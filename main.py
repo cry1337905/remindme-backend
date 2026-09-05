@@ -139,7 +139,7 @@ def register(data: RegisterSchema):
                 detail="Bitte gib entweder einen Firmennamen zum Gründen oder einen Firmen-Code zum Beitritt an."
             )
 
-        # 3. Profil in public.users speichern (OHNE Passwort-Spalte)
+        # 3. Profil in public.users speichern (OHNE password-Feld!)
         supabase.table("users").insert({
             "id": user_id,
             "email": data.email,
@@ -191,7 +191,6 @@ def forgot_password(data: ForgotPasswordSchema):
 @app.post("/reset-password")
 def reset_password(data: ResetPasswordSchema):
     try:
-        # Nimmt an, dass Supabase den OTP/Code verifiziert
         res = supabase.auth.verify_otp({
             "email": data.email,
             "token": data.code,
@@ -284,7 +283,6 @@ def get_groups(current_user: dict = Depends(get_current_user)):
     company_id = current_user.get("company_id")
     res = supabase.table("groups").select("*").eq("company_id", company_id).execute()
     
-    # Formatiert als Dict: {"MTA": ["User1", "User2"]}
     groups_dict = {}
     if res.data:
         for item in res.data:
@@ -296,7 +294,6 @@ def get_groups(current_user: dict = Depends(get_current_user)):
 def save_group(data: GroupSchema, current_user: dict = Depends(get_current_user)):
     company_id = current_user.get("company_id")
     
-    # Prüfen, ob Gruppe bereits existiert
     existing = supabase.table("groups").select("id").eq("name", data.name).eq("company_id", company_id).execute()
     
     if existing.data:
