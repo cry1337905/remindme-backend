@@ -7,7 +7,6 @@ from fastapi import FastAPI, HTTPException, Depends, Header, status
 from pydantic import BaseModel, EmailStr
 from supabase import create_client, Client
 from postgrest.exceptions import APIError
-from gotrue.errors import AuthApiError
 
 # ---------------------------------------------------------------------------
 # INITIALISIERUNG & SUPABASE CLIENT
@@ -109,11 +108,17 @@ def get_current_user(authorization: Optional[str] = Header(None)) -> dict:
 def register(data: RegisterSchema):
     try:
         # 1. Supabase Auth Benutzer erstellen
-        auth_res = supabase.auth.sign_up({
-            "email": data.email,
-            "password": data.password
-        })
-        
+        try:
+            auth_res = supabase.auth.sign_up({
+                "email": data.email,
+                "password": data.password
+            })
+        except Exception as auth_e:
+            err_msg = str(auth_e)
+            if "already registered" in err_msg.lower():
+                raise HTTPException(status_code=400, detail="Diese E-Mail-Adresse ist bereits registriert.")
+            raise HTTPException(status_code=400, detail=f"Registrierungsfehler: {err_msg}")
+
         if not auth_res or not auth_res.user:
             raise HTTPException(status_code=400, detail="Registrierung im Auth-System fehlgeschlagen.")
             
@@ -135,7 +140,6 @@ def register(data: RegisterSchema):
                 "code": assigned_code
             }).execute()
             
-            # Über Code die ID nachladen (sicherer gegen RLS-Rückgabe-Filterung)
             comp_fetch = supabase.table("companies").select("id, code").eq("code", assigned_code).execute()
             if comp_fetch.data and len(comp_fetch.data) > 0:
                 company_id = comp_fetch.data[0]["id"]
@@ -170,9 +174,6 @@ def register(data: RegisterSchema):
             "company_code": assigned_code
         }
 
-    except AuthApiError as auth_err:
-        print(f"AUTH ERROR: {auth_err.message}")
-        raise HTTPException(status_code=400, detail=f"Registrierungsfehler: {auth_err.message}")
     except APIError as api_err:
         print(f"DATABASE ERROR: {api_err}")
         raise HTTPException(status_code=400, detail=f"Datenbankfehler: {api_err.message}")
