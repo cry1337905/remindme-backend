@@ -6,3 +6,4 @@ pydantic[email]
 email-validator
 python-multipart
 psycopg2-binary
+supabase
