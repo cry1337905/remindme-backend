@@ -8,25 +8,30 @@ from pydantic import BaseModel, EmailStr
 from supabase import create_client, Client
 from postgrest.exceptions import APIError
 
+# ---------------------------------------------------------------------------
+# INITIALISIERUNG & SUPABASE CLIENT
+# ---------------------------------------------------------------------------
 SUPABASE_URL = os.environ.get("SUPABASE_URL")
 SUPABASE_KEY = os.environ.get("SUPABASE_KEY")
 
 if not SUPABASE_URL or not SUPABASE_KEY:
-    raise RuntimeError("SUPABASE_URL und SUPABASE_KEY müssen gesetzt sein.")
+    raise RuntimeError("SUPABASE_URL und SUPABASE_KEY müssen als Umgebungsvariablen gesetzt sein.")
 
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 
 app = FastAPI(title="RemindMe Backend")
 
+
 # ---------------------------------------------------------------------------
-# HEALTH CHECK (Behebt 404 Fehler auf Render)
+# HEALTH CHECK (Behebt Render 404 / Health-Check Warnungen)
 # ---------------------------------------------------------------------------
 @app.get("/")
 def health_check():
     return {"status": "ok", "message": "RemindMe API läuft"}
 
+
 # ---------------------------------------------------------------------------
-# SCHEMAS
+# SCHEMAS (DATENMODELLE)
 # ---------------------------------------------------------------------------
 class RegisterSchema(BaseModel):
     email: EmailStr
@@ -59,6 +64,7 @@ class ResetPasswordSchema(BaseModel):
     code: str
     new_password: str
 
+
 # ---------------------------------------------------------------------------
 # HELFERFUNKTIONEN
 # ---------------------------------------------------------------------------
@@ -81,6 +87,8 @@ def get_current_user(authorization: Optional[str] = Header(None)) -> dict:
             raise HTTPException(status_code=401, detail="Sitzung abgelaufen oder ungültig")
         
         user_id = user_res.user.id
+        
+        # Benutzerprofil aus public.users abrufen
         profile_res = supabase.table("users").select("*").eq("id", user_id).execute()
         if not profile_res.data:
             raise HTTPException(status_code=404, detail="Benutzerprofil nicht gefunden")
@@ -92,13 +100,14 @@ def get_current_user(authorization: Optional[str] = Header(None)) -> dict:
             detail=f"Authentifizierungsfehler: {str(e)}",
         )
 
+
 # ---------------------------------------------------------------------------
-# REGISTRIERUNG (MIT DETALLIERTER FEHLERMELDUNG)
+# AUTHENTIFIZIERUNG & REGISTRIERUNG
 # ---------------------------------------------------------------------------
 @app.post("/register")
 def register(data: RegisterSchema):
     try:
-        # 1. Supabase Auth Benutzer erstellen
+        # 1. Supabase Auth Benutzer erstellen (Passwort wird nur hier verarbeitet)
         auth_res = supabase.auth.sign_up({
             "email": data.email,
             "password": data.password
@@ -114,12 +123,13 @@ def register(data: RegisterSchema):
         # 2. Firmeneinbindung verarbeiten
         if data.company_name and data.company_name.strip():
             assigned_code = generate_company_code()
+            # .select() angehängt, um den eingefügten Datensatz samt 'id' zurückzuerhalten
             comp_res = supabase.table("companies").insert({
                 "name": data.company_name.strip(),
                 "code": assigned_code
-            }).execute()
+            }).select().execute()
             
-            if comp_res.data:
+            if comp_res.data and len(comp_res.data) > 0:
                 company_id = comp_res.data[0]["id"]
             else:
                 raise HTTPException(status_code=500, detail="Firma konnte nicht angelegt werden.")
@@ -128,7 +138,7 @@ def register(data: RegisterSchema):
             code_clean = data.company_code.strip().upper()
             comp_res = supabase.table("companies").select("id, code").eq("code", code_clean).execute()
             
-            if not comp_res.data:
+            if not comp_res.data or len(comp_res.data) == 0:
                 raise HTTPException(status_code=400, detail="Ungültiger Firmen-Code. Firma existiert nicht.")
             
             company_id = comp_res.data[0]["id"]
@@ -139,13 +149,13 @@ def register(data: RegisterSchema):
                 detail="Bitte gib entweder einen Firmennamen zum Gründen oder einen Firmen-Code zum Beitritt an."
             )
 
-        # 3. Profil in public.users speichern
+        # 3. Profil in public.users speichern (OHNE password-Feld!)
         supabase.table("users").insert({
             "id": user_id,
             "email": data.email,
             "username": data.username,
             "company_id": company_id
-        }).execute()
+        }).select().execute()
 
         return {
             "message": "Registrierung erfolgreich!",
@@ -161,12 +171,10 @@ def register(data: RegisterSchema):
         print(f"INTERNAL ERROR: {str(e)}")
         raise HTTPException(status_code=500, detail=f"Interner Serverfehler: {str(e)}")
 
-# ---------------------------------------------------------------------------
-# LOGIN & PASSWORT RESET
-# ---------------------------------------------------------------------------
+
 @app.post("/login")
 def login(data: dict):
-    username = data.get("username")
+    username = data.get("username")  # E-Mail
     password = data.get("password")
 
     if not username or not password:
@@ -184,6 +192,7 @@ def login(data: dict):
     except Exception as e:
         raise HTTPException(status_code=400, detail="Anmeldung fehlgeschlagen. E-Mail oder Passwort falsch.")
 
+
 @app.post("/forgot-password")
 def forgot_password(data: ForgotPasswordSchema):
     try:
@@ -191,6 +200,7 @@ def forgot_password(data: ForgotPasswordSchema):
         return {"message": "Passwort-Zurücksetzen-Code gesendet."}
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
+
 
 @app.post("/reset-password")
 def reset_password(data: ResetPasswordSchema):
@@ -207,14 +217,16 @@ def reset_password(data: ResetPasswordSchema):
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"Fehler beim Zurücksetzen: {str(e)}")
 
+
 # ---------------------------------------------------------------------------
-# TASKS, COMMENTS & GROUPS
+# TASKS (AUFGABEN)
 # ---------------------------------------------------------------------------
 @app.get("/tasks")
 def get_tasks(current_user: dict = Depends(get_current_user)):
     company_id = current_user.get("company_id")
     res = supabase.table("tasks").select("*").eq("company_id", company_id).execute()
     return res.data or []
+
 
 @app.post("/tasks")
 def create_task(data: TaskSchema, current_user: dict = Depends(get_current_user)):
@@ -231,30 +243,37 @@ def create_task(data: TaskSchema, current_user: dict = Depends(get_current_user)
         "status": "Offen"
     }
 
-    res = supabase.table("tasks").insert(payload).execute()
+    res = supabase.table("tasks").insert(payload).select().execute()
     if res.data:
         return res.data[0]
     raise HTTPException(status_code=500, detail="Aufgabe konnte nicht erstellt werden.")
+
 
 @app.patch("/tasks/{task_id}/status")
 @app.put("/tasks/{task_id}")
 def update_task_status(task_id: str, data: StatusUpdateSchema, current_user: dict = Depends(get_current_user)):
     company_id = current_user.get("company_id")
-    res = supabase.table("tasks").update({"status": data.status}).eq("id", task_id).eq("company_id", company_id).execute()
+    res = supabase.table("tasks").update({"status": data.status}).eq("id", task_id).eq("company_id", company_id).select().execute()
     if res.data:
         return res.data[0]
     raise HTTPException(status_code=404, detail="Aufgabe nicht gefunden oder keine Berechtigung.")
 
+
 @app.delete("/tasks/{task_id}")
 def delete_task(task_id: str, current_user: dict = Depends(get_current_user)):
     company_id = current_user.get("company_id")
-    res = supabase.table("tasks").delete().eq("id", task_id).eq("company_id", company_id).execute()
+    supabase.table("tasks").delete().eq("id", task_id).eq("company_id", company_id).execute()
     return {"message": "Aufgabe gelöscht."}
 
+
+# ---------------------------------------------------------------------------
+# KOMMENTARE & CHAT
+# ---------------------------------------------------------------------------
 @app.get("/tasks/{task_id}/comments")
 def get_comments(task_id: str, current_user: dict = Depends(get_current_user)):
     res = supabase.table("comments").select("*").eq("task_id", task_id).order("created_at", desc=False).execute()
     return res.data or []
+
 
 @app.post("/tasks/{task_id}/comments")
 def add_comment(task_id: str, data: CommentSchema, current_user: dict = Depends(get_current_user)):
@@ -264,11 +283,15 @@ def add_comment(task_id: str, data: CommentSchema, current_user: dict = Depends(
         "author": author,
         "message": data.message
     }
-    res = supabase.table("comments").insert(payload).execute()
+    res = supabase.table("comments").insert(payload).select().execute()
     if res.data:
         return res.data[0]
     raise HTTPException(status_code=500, detail="Kommentar konnte nicht gespeichert werden.")
 
+
+# ---------------------------------------------------------------------------
+# GRUPPEN
+# ---------------------------------------------------------------------------
 @app.get("/groups")
 def get_groups(current_user: dict = Depends(get_current_user)):
     company_id = current_user.get("company_id")
@@ -280,6 +303,7 @@ def get_groups(current_user: dict = Depends(get_current_user)):
             groups_dict[item["name"]] = item.get("members", [])
     return groups_dict
 
+
 @app.post("/groups")
 def save_group(data: GroupSchema, current_user: dict = Depends(get_current_user)):
     company_id = current_user.get("company_id")
@@ -287,15 +311,16 @@ def save_group(data: GroupSchema, current_user: dict = Depends(get_current_user)
     existing = supabase.table("groups").select("id").eq("name", data.name).eq("company_id", company_id).execute()
     
     if existing.data:
-        res = supabase.table("groups").update({"members": data.members}).eq("id", existing.data[0]["id"]).execute()
+        res = supabase.table("groups").update({"members": data.members}).eq("id", existing.data[0]["id"]).select().execute()
     else:
         res = supabase.table("groups").insert({
             "name": data.name,
             "members": data.members,
             "company_id": company_id
-        }).execute()
+        }).select().execute()
 
     return {"message": f"Gruppe '{data.name}' gespeichert."}
+
 
 @app.delete("/groups/{group_name}")
 @app.delete("/groups")
