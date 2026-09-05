@@ -1,477 +1,323 @@
-import datetime
-import json
 import os
 import random
-import secrets
 import string
-import urllib.parse
-import urllib.request
+import uuid
 from typing import List, Optional
-
-from fastapi import Depends, FastAPI, HTTPException, status
-from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
-from pydantic import BaseModel
-from supabase import Client, create_client
-
-app = FastAPI(title="Remind Me Backend")
+from fastapi import FastAPI, HTTPException, Depends, Header, status
+from pydantic import BaseModel, EmailStr
+from supabase import create_client, Client
 
 # ---------------------------------------------------------------------------
-# SUPABASE KONFIGURATION
+# INITIALISIERUNG & SUPABASE CLIENT
 # ---------------------------------------------------------------------------
-SUPABASE_URL = os.getenv("SUPABASE_URL", "")
-SUPABASE_KEY = os.getenv("SUPABASE_KEY", "")
+SUPABASE_URL = os.environ.get("SUPABASE_URL")
+SUPABASE_KEY = os.environ.get("SUPABASE_KEY")
 
 if not SUPABASE_URL or not SUPABASE_KEY:
-    print(
-        "[WARNUNG] SUPABASE_URL oder SUPABASE_KEY fehlen in den"
-        " Umgebungsvariablen!"
-    )
+    raise RuntimeError("SUPABASE_URL und SUPABASE_KEY müssen als Umgebungsvariablen gesetzt sein.")
 
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 
-# ---------------------------------------------------------------------------
-# BREVO E-MAIL KONFIGURATION (HTTP API)
-# ---------------------------------------------------------------------------
-SMTP_PASSWORD = os.getenv("SMTP_PASSWORD", "")
-SENDER_EMAIL = os.getenv("SENDER_EMAIL", os.getenv("SMTP_USER", ""))
-
-
-def send_reset_email(to_email: str, code: str) -> bool:
-    """Sendet eine E-Mail direkt über die Brevo HTTP API."""
-    if not SMTP_PASSWORD:
-        print("[WARNUNG] SMTP_PASSWORD ist nicht in Render gesetzt!")
-        return False
-
-    url = "https://api.brevo.com/v3/smtp/email"
-    headers = {
-        "accept": "application/json",
-        "api-key": SMTP_PASSWORD,
-        "content-type": "application/json",
-    }
-    payload = {
-        "sender": {"name": "RemindMe App", "email": SENDER_EMAIL},
-        "to": [{"email": to_email}],
-        "subject": "Dein Passwort-Reset-Code",
-        "textContent": (
-            f"Hallo,\n\n"
-            f"dein Sicherheitscode zum Zurücksetzen des Passports lautet:\n\n"
-            f"   {code}\n\n"
-            f"Falls du dies nicht angefordert hast, kannst du diese E-Mail"
-            f" einfach ignorieren.\n\n"
-            f"Viele Grüße,\n"
-            f"Dein RemindMe Team"
-        ),
-    }
-
-    try:
-        req = urllib.request.Request(
-            url, data=json.dumps(payload).encode("utf-8"), headers=headers
-        )
-        with urllib.request.urlopen(req, timeout=10) as response:
-            if response.status in (200, 201):
-                print(f"[LOG] E-Mail erfolgreich an {to_email} gesendet.")
-                return True
-    except Exception as e:
-        print(f"[FEHLER] E-Mail konnte nicht via API gesendet werden: {e}")
-        return False
-
-
-oauth2_scheme = OAuth2PasswordBearer(tokenUrl="login")
+app = FastAPI(title="RemindMe Backend")
 
 
 # ---------------------------------------------------------------------------
-# HELFER
+# SCHEMAS (DATENMODELLE)
 # ---------------------------------------------------------------------------
-def generate_company_code() -> str:
-    """Generiert einen zufälligen 8-stelligen Firmen-Code (z. B. COMP-A8X2)."""
-    suffix = "".join(
-        secrets.choice(string.ascii_uppercase + string.digits) for _ in range(4)
-    )
-    return f"COMP-{suffix}"
-
-
-# ---------------------------------------------------------------------------
-# PYDANTIC SCHEMAS
-# ---------------------------------------------------------------------------
-class UserRegister(BaseModel):
-    email: str
+class RegisterSchema(BaseModel):
+    email: EmailStr
     username: str
     password: str
-    company_code: Optional[str] = None  # Bei Beitritt
-    company_name: Optional[str] = None  # Bei Neugründung
-
+    company_name: Optional[str] = None
+    company_code: Optional[str] = None
 
 class GroupSchema(BaseModel):
     name: str
     members: List[str]
 
-
-class TaskCreate(BaseModel):
+class TaskSchema(BaseModel):
     title: str
     description: str
     assignee: str
     deadline: str
 
-
-class TaskStatusUpdate(BaseModel):
+class StatusUpdateSchema(BaseModel):
     status: str
 
-
-class CommentCreate(BaseModel):
+class CommentSchema(BaseModel):
     message: str
 
+class ForgotPasswordSchema(BaseModel):
+    email: EmailStr
 
-class ForgotPasswordRequest(BaseModel):
-    email: str
-
-
-class ResetPasswordRequest(BaseModel):
-    email: str
+class ResetPasswordSchema(BaseModel):
+    email: EmailStr
     code: str
     new_password: str
 
 
 # ---------------------------------------------------------------------------
-# AUTHENTIFIZIERUNG & NUTZER-DATEN
+# HELFERFUNKTIONEN
 # ---------------------------------------------------------------------------
-def get_current_user_data(token: str = Depends(oauth2_scheme)) -> dict:
-    """Ermittelt den aktuellen Nutzer und seine Firmendaten direkt aus Supabase."""
-    clean_token = token.strip().lower()
+def generate_company_code(length: int = 6) -> str:
+    chars = string.ascii_uppercase + string.digits
+    return "COMP-" + "".join(random.choices(chars, k=length))
 
-    res = (
-        supabase.table("users")
-        .select("email, username, company_code")
-        .eq("email", clean_token)
-        .execute()
-    )
-
-    if not res.data:
+def get_current_user(authorization: Optional[str] = Header(None)) -> dict:
+    if not authorization or not authorization.startswith("Bearer "):
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Ungültiges Authentifizierungs-Token oder Nutzer nicht gefunden.",
-            headers={"WWW-Authenticate": "Bearer"},
+            detail="Ungültiger oder fehlender Authorization Header",
         )
-
-    return res.data[0]
+    
+    token = authorization.split(" ")[1]
+    
+    try:
+        user_res = supabase.auth.get_user(token)
+        if not user_res.user:
+            raise HTTPException(status_code=401, detail="Sitzung abgelaufen oder ungültig")
+        
+        user_id = user_res.user.id
+        
+        # Benutzerprofil aus public.users abrufen
+        profile_res = supabase.table("users").select("*").eq("id", user_id).execute()
+        if not profile_res.data:
+            raise HTTPException(status_code=404, detail="Benutzerprofil nicht gefunden")
+            
+        return profile_res.data[0]
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail=f"Authentifizierungsfehler: {str(e)}",
+        )
 
 
 # ---------------------------------------------------------------------------
-# USER & AUTH ENDPUNKTE
+# AUTHENTIFIZIERUNG & REGISTRIERUNG
 # ---------------------------------------------------------------------------
 @app.post("/register")
-def register(user: UserRegister):
-    email_clean = user.email.strip().lower()
+def register(data: RegisterSchema):
+    try:
+        # 1. Supabase Auth Benutzer erstellen (Passwort wird nur hier verarbeitet)
+        auth_res = supabase.auth.sign_up({
+            "email": data.email,
+            "password": data.password
+        })
+        
+        if not auth_res.user:
+            raise HTTPException(status_code=400, detail="Registrierung im Auth-System fehlgeschlagen.")
+            
+        user_id = auth_res.user.id
+        company_id = None
+        assigned_code = None
 
-    # Prüfen, ob E-Mail bereits existiert
-    existing = (
-        supabase.table("users")
-        .select("email")
-        .eq("email", email_clean)
-        .execute()
-    )
-    if existing.data:
-        raise HTTPException(
-            status_code=400, detail="E-Mail-Adresse ist bereits registriert."
-        )
+        # 2. Firmeneinbindung verarbeiten
+        if data.company_name and data.company_name.strip():
+            assigned_code = generate_company_code()
+            comp_res = supabase.table("companies").insert({
+                "name": data.company_name.strip(),
+                "code": assigned_code
+            }).execute()
+            
+            if comp_res.data:
+                company_id = comp_res.data[0]["id"]
+            else:
+                raise HTTPException(status_code=500, detail="Firma konnte nicht angelegt werden.")
 
-    assigned_code = None
-
-    # Option A: Neue Firma gründen
-    if user.company_name and user.company_name.strip():
-        assigned_code = generate_company_code()
-        supabase.table("companies").insert(
-            {"code": assigned_code, "name": user.company_name.strip()}
-        ).execute()
-
-    # Option B: Bestehender Firma beitreten
-    elif user.company_code and user.company_code.strip():
-        code_clean = user.company_code.strip().upper()
-        company_res = (
-            supabase.table("companies")
-            .select("code")
-            .eq("code", code_clean)
-            .execute()
-        )
-
-        if not company_res.data:
+        elif data.company_code and data.company_code.strip():
+            code_clean = data.company_code.strip().upper()
+            comp_res = supabase.table("companies").select("id, code").eq("code", code_clean).execute()
+            
+            if not comp_res.data:
+                raise HTTPException(status_code=400, detail="Ungültiger Firmen-Code. Firma existiert nicht.")
+            
+            company_id = comp_res.data[0]["id"]
+            assigned_code = comp_res.data[0]["code"]
+        else:
             raise HTTPException(
-                status_code=400,
-                detail="Der eingegebene Firmen-Code ist ungültig.",
+                status_code=400, 
+                detail="Bitte gib entweder einen Firmennamen zum Gründen oder einen Firmen-Code zum Beitritt an."
             )
-        assigned_code = code_clean
 
-    else:
-        raise HTTPException(
-            status_code=400,
-            detail=(
-                "Bitte gib entweder einen Firmennamen an (Neugründung) oder"
-                " einen Firmen-Code (Beitritt)."
-            ),
-        )
+        # 3. Profil in public.users speichern (OHNE Passwort-Spalte)
+        supabase.table("users").insert({
+            "id": user_id,
+            "email": data.email,
+            "username": data.username,
+            "company_id": company_id
+        }).execute()
 
-    # Nutzer in Supabase anlegen
-    supabase.table("users").insert(
-        {
-            "email": email_clean,
-            "username": user.username.strip(),
-            "password": user.password,
-            "company_code": assigned_code,
+        return {
+            "message": "Registrierung erfolgreich!",
+            "company_code": assigned_code
         }
-    ).execute()
 
-    return {
-        "message": "Registrierung erfolgreich",
-        "company_code": assigned_code,
-    }
+    except HTTPException as http_e:
+        raise http_e
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Interner Serverfehler: {str(e)}")
 
 
 @app.post("/login")
-def login(form_data: OAuth2PasswordRequestForm = Depends()):
-    email_clean = form_data.username.strip().lower()
+def login(data: dict):
+    username = data.get("username")  # E-Mail
+    password = data.get("password")
 
-    res = (
-        supabase.table("users")
-        .select("email, password")
-        .eq("email", email_clean)
-        .execute()
-    )
+    if not username or not password:
+        raise HTTPException(status_code=400, detail="E-Mail und Passwort erforderlich")
 
-    if not res.data or res.data[0]["password"] != form_data.password:
-        raise HTTPException(
-            status_code=400, detail="Ungültige E-Mail oder Passwort."
-        )
-
-    return {"access_token": email_clean, "token_type": "bearer"}
+    try:
+        res = supabase.auth.sign_in_with_password({
+            "email": username,
+            "password": password
+        })
+        return {
+            "access_token": res.session.access_token,
+            "token_type": "bearer"
+        }
+    except Exception as e:
+        raise HTTPException(status_code=400, detail="Anmeldung fehlgeschlagen. E-Mail oder Passwort falsch.")
 
 
 @app.post("/forgot-password")
-def forgot_password(req: ForgotPasswordRequest):
-    email_clean = req.email.strip().lower()
-
-    user_res = (
-        supabase.table("users")
-        .select("email")
-        .eq("email", email_clean)
-        .execute()
-    )
-    if not user_res.data:
-        raise HTTPException(
-            status_code=404,
-            detail="Kein Konto mit dieser E-Mail-Adresse gefunden.",
-        )
-
-    code = f"{random.randint(100000, 999999)}"
-
-    # Code in Supabase speichern/aktualisieren
-    supabase.table("users").update({"reset_code": code}).eq(
-        "email", email_clean
-    ).execute()
-
-    email_sent = send_reset_email(email_clean, code)
-    if not email_sent:
-        print(f"[FALLBACK] E-Mail-Versand fehlgeschlagen. Code lautet: {code}")
-
-    return {"message": "Reset-Code wurde per E-Mail versendet."}
+def forgot_password(data: ForgotPasswordSchema):
+    try:
+        supabase.auth.reset_password_email(data.email)
+        return {"message": "Passwort-Zurücksetzen-Code gesendet."}
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
 
 
 @app.post("/reset-password")
-def reset_password(req: ResetPasswordRequest):
-    email_clean = req.email.strip().lower()
-
-    res = (
-        supabase.table("users")
-        .select("reset_code")
-        .eq("email", email_clean)
-        .execute()
-    )
-
-    if not res.data or res.data[0].get("reset_code") != req.code.strip():
-        raise HTTPException(
-            status_code=400, detail="Ungültiger oder abgelaufener Code."
-        )
-
-    supabase.table("users").update(
-        {"password": req.new_password.strip(), "reset_code": None}
-    ).eq("email", email_clean).execute()
-
-    return {"message": "Passwort erfolgreich zurückgesetzt."}
+def reset_password(data: ResetPasswordSchema):
+    try:
+        # Nimmt an, dass Supabase den OTP/Code verifiziert
+        res = supabase.auth.verify_otp({
+            "email": data.email,
+            "token": data.code,
+            "type": "recovery"
+        })
+        if res.session:
+            supabase.auth.update_user({"password": data.new_password})
+            return {"message": "Passwort erfolgreich zurückgesetzt."}
+        raise HTTPException(status_code=400, detail="Ungültiger Code.")
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Fehler beim Zurücksetzen: {str(e)}")
 
 
 # ---------------------------------------------------------------------------
-# GRUPPEN ENDPUNKTE (Firmenspezifisch)
-# ---------------------------------------------------------------------------
-@app.get("/groups")
-def get_groups(current_user: dict = Depends(get_current_user_data)):
-    res = (
-        supabase.table("groups")
-        .select("name, members")
-        .eq("company_code", current_user["company_code"])
-        .execute()
-    )
-
-    groups_dict = {item["name"]: item.get("members", []) for item in res.data}
-    return groups_dict
-
-
-@app.post("/groups")
-def save_group(
-    group: GroupSchema, current_user: dict = Depends(get_current_user_data)
-):
-    group_name = group.name.strip()
-    company_code = current_user["company_code"]
-
-    existing = (
-        supabase.table("groups")
-        .select("id")
-        .eq("company_code", company_code)
-        .eq("name", group_name)
-        .execute()
-    )
-
-    if existing.data:
-        supabase.table("groups").update({"members": group.members}).eq(
-            "id", existing.data[0]["id"]
-        ).execute()
-    else:
-        supabase.table("groups").insert(
-            {
-                "name": group_name,
-                "members": group.members,
-                "company_code": company_code,
-            }
-        ).execute()
-
-    return {"message": f"Gruppe '{group_name}' erfolgreich gespeichert."}
-
-
-@app.delete("/groups/{group_name}")
-def delete_group(
-    group_name: str, current_user: dict = Depends(get_current_user_data)
-):
-    decoded_name = urllib.parse.unquote(group_name).strip()
-    company_code = current_user["company_code"]
-
-    res = (
-        supabase.table("groups")
-        .delete()
-        .eq("company_code", company_code)
-        .eq("name", decoded_name)
-        .execute()
-    )
-
-    if res.data:
-        return {
-            "message": f"Gruppe '{decoded_name}' wurde erfolgreich gelöscht."
-        }
-
-    raise HTTPException(
-        status_code=404,
-        detail=f"Gruppe '{decoded_name}' wurde nicht gefunden.",
-    )
-
-
-# ---------------------------------------------------------------------------
-# TASK ENDPUNKTE (Firmenspezifisch)
+# TASKS (AUFGABEN)
 # ---------------------------------------------------------------------------
 @app.get("/tasks")
-def get_tasks(current_user: dict = Depends(get_current_user_data)):
-    res = (
-        supabase.table("tasks")
-        .select("*")
-        .eq("company_code", current_user["company_code"])
-        .execute()
-    )
-    return res.data
+def get_tasks(current_user: dict = Depends(get_current_user)):
+    company_id = current_user.get("company_id")
+    res = supabase.table("tasks").select("*").eq("company_id", company_id).execute()
+    return res.data or []
 
 
 @app.post("/tasks")
-def create_task(
-    task: TaskCreate, current_user: dict = Depends(get_current_user_data)
-):
-    new_task = {
-        "title": task.title,
-        "description": task.description,
-        "assignee": task.assignee,
-        "deadline": task.deadline,
-        "status": "Offen",
-        "created_by": current_user["username"],
-        "company_code": current_user["company_code"],
+def create_task(data: TaskSchema, current_user: dict = Depends(get_current_user)):
+    company_id = current_user.get("company_id")
+    created_by = current_user.get("username") or current_user.get("email")
+
+    payload = {
+        "title": data.title,
+        "description": data.description,
+        "assignee": data.assignee,
+        "deadline": data.deadline,
+        "company_id": company_id,
+        "created_by": created_by,
+        "status": "Offen"
     }
 
-    res = supabase.table("tasks").insert(new_task).execute()
-    return res.data[0] if res.data else new_task
+    res = supabase.table("tasks").insert(payload).execute()
+    if res.data:
+        return res.data[0]
+    raise HTTPException(status_code=500, detail="Aufgabe konnte nicht erstellt werden.")
 
 
 @app.patch("/tasks/{task_id}/status")
 @app.put("/tasks/{task_id}")
-def update_task_status(
-    task_id: int,
-    status_update: TaskStatusUpdate,
-    current_user: dict = Depends(get_current_user_data),
-):
-    res = (
-        supabase.table("tasks")
-        .update({"status": status_update.status})
-        .eq("id", task_id)
-        .eq("company_code", current_user["company_code"])
-        .execute()
-    )
-
+def update_task_status(task_id: str, data: StatusUpdateSchema, current_user: dict = Depends(get_current_user)):
+    company_id = current_user.get("company_id")
+    res = supabase.table("tasks").update({"status": data.status}).eq("id", task_id).eq("company_id", company_id).execute()
     if res.data:
         return res.data[0]
-
-    raise HTTPException(status_code=404, detail="Aufgabe nicht gefunden.")
+    raise HTTPException(status_code=404, detail="Aufgabe nicht gefunden oder keine Berechtigung.")
 
 
 @app.delete("/tasks/{task_id}")
-def delete_task(
-    task_id: int, current_user: dict = Depends(get_current_user_data)
-):
-    company_code = current_user["company_code"]
-
-    res = (
-        supabase.table("tasks")
-        .delete()
-        .eq("id", task_id)
-        .eq("company_code", company_code)
-        .execute()
-    )
-
-    if res.data:
-        supabase.table("comments").delete().eq("task_id", task_id).execute()
-        return {"message": "Aufgabe gelöscht."}
-
-    raise HTTPException(status_code=404, detail="Aufgabe nicht gefunden.")
+def delete_task(task_id: str, current_user: dict = Depends(get_current_user)):
+    company_id = current_user.get("company_id")
+    res = supabase.table("tasks").delete().eq("id", task_id).eq("company_id", company_id).execute()
+    return {"message": "Aufgabe gelöscht."}
 
 
 # ---------------------------------------------------------------------------
-# KOMMENTAR ENDPUNKTE (Firmenspezifisch)
+# KOMMENTARE & CHAT
 # ---------------------------------------------------------------------------
 @app.get("/tasks/{task_id}/comments")
-def get_comments(
-    task_id: str, current_user: dict = Depends(get_current_user_data)
-):
-    res = (
-        supabase.table("comments")
-        .select("author, message, timestamp")
-        .eq("task_id", task_id)
-        .execute()
-    )
-    return res.data if res.data else []
+def get_comments(task_id: str, current_user: dict = Depends(get_current_user)):
+    res = supabase.table("comments").select("*").eq("task_id", task_id).order("created_at", desc=False).execute()
+    return res.data or []
 
 
 @app.post("/tasks/{task_id}/comments")
-def add_comment(
-    task_id: str,
-    comment: CommentCreate,
-    current_user: dict = Depends(get_current_user_data),
-):
-    comment_entry = {
+def add_comment(task_id: str, data: CommentSchema, current_user: dict = Depends(get_current_user)):
+    author = current_user.get("username") or current_user.get("email")
+    payload = {
         "task_id": task_id,
-        "author": current_user["username"],
-        "message": comment.message,
-        "timestamp": datetime.datetime.now().strftime("%H:%M:%S"),
+        "author": author,
+        "message": data.message
     }
+    res = supabase.table("comments").insert(payload).execute()
+    if res.data:
+        return res.data[0]
+    raise HTTPException(status_code=500, detail="Kommentar konnte nicht gespeichert werden.")
 
-    supabase.table("comments").insert(comment_entry).execute()
-    return comment_entry
+
+# ---------------------------------------------------------------------------
+# GRUPPEN
+# ---------------------------------------------------------------------------
+@app.get("/groups")
+def get_groups(current_user: dict = Depends(get_current_user)):
+    company_id = current_user.get("company_id")
+    res = supabase.table("groups").select("*").eq("company_id", company_id).execute()
+    
+    # Formatiert als Dict: {"MTA": ["User1", "User2"]}
+    groups_dict = {}
+    if res.data:
+        for item in res.data:
+            groups_dict[item["name"]] = item.get("members", [])
+    return groups_dict
+
+
+@app.post("/groups")
+def save_group(data: GroupSchema, current_user: dict = Depends(get_current_user)):
+    company_id = current_user.get("company_id")
+    
+    # Prüfen, ob Gruppe bereits existiert
+    existing = supabase.table("groups").select("id").eq("name", data.name).eq("company_id", company_id).execute()
+    
+    if existing.data:
+        res = supabase.table("groups").update({"members": data.members}).eq("id", existing.data[0]["id"]).execute()
+    else:
+        res = supabase.table("groups").insert({
+            "name": data.name,
+            "members": data.members,
+            "company_id": company_id
+        }).execute()
+
+    return {"message": f"Gruppe '{data.name}' gespeichert."}
+
+
+@app.delete("/groups/{group_name}")
+@app.delete("/groups")
+def delete_group(group_name: Optional[str] = None, name: Optional[str] = None, current_user: dict = Depends(get_current_user)):
+    target_name = group_name or name
+    if not target_name:
+        raise HTTPException(status_code=400, detail="Gruppenname erforderlich.")
+        
+    company_id = current_user.get("company_id")
+    supabase.table("groups").delete().eq("name", target_name).eq("company_id", company_id).execute()
+    return {"message": f"Gruppe '{target_name}' gelöscht."}
