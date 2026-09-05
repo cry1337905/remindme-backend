@@ -40,6 +40,10 @@ class RegisterSchema(BaseModel):
     company_name: Optional[str] = None
     company_code: Optional[str] = None
 
+class LoginSchema(BaseModel):
+    email: EmailStr
+    password: str
+
 class GroupSchema(BaseModel):
     name: str
     members: List[str]
@@ -188,24 +192,26 @@ def register(data: RegisterSchema):
 # LOGIN & PASSWORT RESET
 # ---------------------------------------------------------------------------
 @app.post("/login")
-def login(data: dict):
-    username = data.get("username")
-    password = data.get("password")
-
-    if not username or not password:
-        raise HTTPException(status_code=400, detail="E-Mail und Passwort erforderlich")
-
+def login(data: LoginSchema):
     try:
         res = supabase.auth.sign_in_with_password({
-            "email": username,
-            "password": password
+            "email": data.email,
+            "password": data.password
         })
+        
+        if not res.session:
+            raise HTTPException(status_code=400, detail="Anmeldung fehlgeschlagen.")
+
         return {
             "access_token": res.session.access_token,
             "token_type": "bearer"
         }
     except Exception as e:
-        raise HTTPException(status_code=400, detail="Anmeldung fehlgeschlagen. E-Mail oder Passwort falsch.")
+        print(f"LOGIN ERROR: {str(e)}")
+        raise HTTPException(
+            status_code=400, 
+            detail="Anmeldung fehlgeschlagen. E-Mail oder Passwort falsch."
+        )
 
 
 @app.post("/forgot-password")
