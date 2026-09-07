@@ -16,7 +16,6 @@ SUPABASE_URL = os.getenv("SUPABASE_URL", "https://ligaopexwxgoirrpiuwi.supabase.
 SUPABASE_KEY = os.getenv("SUPABASE_KEY")
 
 if not SUPABASE_KEY:
-    # Fängt den Fehler ab, falls die Variable auf Render noch nicht gesetzt wurde
     print("[WARNUNG] SUPABASE_KEY ist nicht in den Umgebungsvariablen gesetzt!")
 
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY or "DUMMY_KEY")
@@ -133,11 +132,17 @@ def login(data: LoginModel):
         raise HTTPException(status_code=400, detail="E-Mail oder Passwort falsch")
 
     user = res.data[0]
-    db_password = user["password"]
+
+    # Passwort-Feld flexibel ermitteln (falls in Supabase 'passwort' statt 'password' steht)
+    db_password = user.get("password") or user.get("passwort") or user.get("pwd") or user.get("hash")
+
+    if not db_password:
+        print(f"[ERROR] Verfügbare Spalten in Supabase-Tabelle 'users': {list(user.keys())}")
+        raise HTTPException(status_code=500, detail="Passwort-Spalte in der Supabase-Datenbank nicht gefunden")
 
     # Prüft gehashte Passwörter sowie ältere Klartext-Einträge
     is_valid = False
-    if db_password.startswith("$2b$") or db_password.startswith("$2a$"):
+    if str(db_password).startswith("$2b$") or str(db_password).startswith("$2a$"):
         is_valid = bcrypt.checkpw(data.password.encode('utf-8'), db_password.encode('utf-8'))
     else:
         is_valid = (db_password == data.password)
