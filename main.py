@@ -9,7 +9,7 @@ from pydantic import BaseModel, EmailStr
 from supabase import create_client, Client
 
 # ---------------------------------------------------------------------------
-# SUPABASE KONFIGURATION (SICHER ÜBER UMGEBUNGSVARIABLEN)
+# SUPABASE KONFIGURATION
 # ---------------------------------------------------------------------------
 SUPABASE_URL = os.getenv("SUPABASE_URL", "https://ligaopexwxgoirrpiuwi.supabase.co")
 SUPABASE_KEY = os.getenv("SUPABASE_KEY")
@@ -76,7 +76,7 @@ class CommentModel(BaseModel):
 
 
 # ---------------------------------------------------------------------------
-# AUTHENTIFIZIERUNGS-DEPENDENCY
+# AUTHENTIFIZIERUNGS-DEPENDENCY & HILFSFUNKTIONEN
 # ---------------------------------------------------------------------------
 def get_current_user(authorization: Optional[str] = Header(None)) -> str:
     if not authorization or not authorization.startswith("Bearer "):
@@ -86,15 +86,20 @@ def get_current_user(authorization: Optional[str] = Header(None)) -> str:
         raise HTTPException(status_code=401, detail="Token ungültig oder abgelaufen")
     return TOKENS[token]
 
+def get_user_company_id(email: str) -> Optional[str]:
+    res = supabase.table("users").select("company_id").eq("email", email).execute()
+    if res.data and len(res.data) > 0:
+        return res.data[0].get("company_id")
+    return None
+
 
 # ---------------------------------------------------------------------------
-# AUTH ENDPUNKTE (NATIVE SUPABASE AUTHENTIFIZIERUNG)
+# AUTH ENDPUNKTE
 # ---------------------------------------------------------------------------
 @app.post("/register")
 def register(data: RegisterModel):
     email = data.email.strip().lower()
 
-    # 1. Firmen-Code prüfen oder neu anlegen
     company_code = data.company_code
     if data.company_name:
         company_code = f"COMP-{secrets.token_hex(2).upper()}"
@@ -104,7 +109,6 @@ def register(data: RegisterModel):
         if not comp_res.data:
             raise HTTPException(status_code=400, detail="Ungültiger Firmen-Code")
 
-    # 2. Account über Supabase Auth registrieren
     try:
         auth_response = supabase.auth.sign_up({
             "email": email,
@@ -119,7 +123,6 @@ def register(data: RegisterModel):
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"Registrierung fehlgeschlagen: {str(e)}")
 
-    # 3. Profil-Daten in eigener `users`-Tabelle absichern/ergänzen
     user_res = supabase.table("users").select("*").eq("email", email).execute()
     if not user_res.data:
         supabase.table("users").insert({
@@ -135,7 +138,6 @@ def register(data: RegisterModel):
 def login(data: LoginModel):
     email = data.email.strip().lower()
 
-    # Login direkt über den Supabase Auth Service
     try:
         auth_response = supabase.auth.sign_in_with_password({
             "email": email,
@@ -166,7 +168,6 @@ def forgot_password(data: ForgotPasswordModel):
 
 @app.post("/reset-password")
 def reset_password(data: ResetPasswordModel):
-    # Bei Verwendung von Supabase Auth wird das Zurücksetzen standardmäßig über E-Mail-Links abgewickelt
     raise HTTPException(
         status_code=400, 
         detail="Bitte nutze den Link in der E-Mail zum Zurücksetzen des Passworts."
@@ -174,30 +175,47 @@ def reset_password(data: ResetPasswordModel):
 
 
 # ---------------------------------------------------------------------------
-# TASK & CHAT ENDPUNKTE
+# GRUPPEN (SUPABASE INTEGRATION)
 # ---------------------------------------------------------------------------
-TASKS = []
-COMMENTS = {}
-GROUPS = {}
-
 @app.get("/groups")
 def get_groups(user: str = Depends(get_current_user)):
-    return GROUPS
+    res = supabase.table("groups").select("*").execute()
+    if not res.data:
+        return []
+    return res.data
 
 @app.post("/groups")
 def save_group(data: GroupModel, user: str = Depends(get_current_user)):
-    GROUPS[data.name] = data.members
-    return {"message": "Gruppe gespeichert"}
+    company_id = get_user_company_id(user)
+    payload = {
+        "name": data.name,
+        "members": data.members,
+    }
+    if company_id:
+        payload["company_id"] = company_id
 
+    # Upsert (Einfügen oder Aktualisieren, falls Name existiert)
+    res = supabase.table("groups").upsert(payload, on_conflict="name").execute()
+    return {"message": "Gruppe in Supabase gespeichert", "data": res.data}
+
+@app.delete("/groups/{name}")
+def delete_group(name: str, user: str = Depends(get_current_user)):
+    supabase.table("groups").delete().eq("name", name).execute()
+    return {"message": f"Gruppe {name} gelöscht"}
+
+
+# ---------------------------------------------------------------------------
+# TASKS (SUPABASE INTEGRATION)
+# ---------------------------------------------------------------------------
 @app.get("/tasks")
 def get_tasks(user: str = Depends(get_current_user)):
-    return TASKS
+    res = supabase.table("tasks").select("*").execute()
+    return res.data or []
 
 @app.post("/tasks")
 def create_task(data: TaskCreateModel, user: str = Depends(get_current_user)):
-    task_id = str(len(TASKS) + 1)
-    new_task = {
-        "id": task_id,
+    company_id = get_user_company_id(user)
+    payload = {
         "title": data.title,
         "description": data.description,
         "assignee": data.assignee,
@@ -205,39 +223,46 @@ def create_task(data: TaskCreateModel, user: str = Depends(get_current_user)):
         "status": "Offen",
         "created_by": user
     }
-    TASKS.append(new_task)
-    COMMENTS[task_id] = []
-    return new_task
+    if company_id:
+        payload["company_id"] = company_id
+
+    res = supabase.table("tasks").insert(payload).execute()
+    return res.data[0] if res.data else payload
 
 @app.patch("/tasks/{task_id}/status")
 @app.put("/tasks/{task_id}")
 def update_task_status(task_id: str, data: TaskStatusModel, user: str = Depends(get_current_user)):
-    for task in TASKS:
-        if str(task["id"]) == str(task_id):
-            task["status"] = data.status
-            return task
-    raise HTTPException(status_code=404, detail="Aufgabe nicht gefunden")
+    res = supabase.table("tasks").update({"status": data.status}).eq("id", task_id).execute()
+    if not res.data:
+        raise HTTPException(status_code=404, detail="Aufgabe nicht gefunden")
+    return res.data[0]
 
+@app.delete("/tasks/{task_id}")
+def delete_task(task_id: str, user: str = Depends(get_current_user)):
+    supabase.table("tasks").delete().eq("id", task_id).execute()
+    return {"message": "Aufgabe gelöscht"}
+
+
+# ---------------------------------------------------------------------------
+# CHAT & KOMMENTARE (SUPABASE INTEGRATION)
+# ---------------------------------------------------------------------------
 @app.get("/tasks/{task_id}/comments")
 def get_comments(task_id: str, user: str = Depends(get_current_user)):
-    return COMMENTS.get(str(task_id), [])
+    res = supabase.table("comments").select("*").eq("task_id", task_id).execute()
+    return res.data or []
 
 @app.post("/tasks/{task_id}/comments")
 def add_comment(task_id: str, data: CommentModel, user: str = Depends(get_current_user)):
-    str_id = str(task_id)
-    if str_id not in COMMENTS:
-        COMMENTS[str_id] = []
-    
-    comment_entry = {
+    payload = {
+        "task_id": task_id,
         "author": user,
-        "message": data.message,
+        "message": data.message
     }
-    COMMENTS[str_id].append(comment_entry)
-    return {"message": "Kommentar hinzugefügt"}
+    supabase.table("comments").insert(payload).execute()
+    return {"message": "Kommentar in Supabase gespeichert"}
 
 @app.post("/tasks/{task_id}/upload")
 def upload_file(task_id: str, file: UploadFile = File(...), user: str = Depends(get_current_user)):
-    str_id = str(task_id)
     safe_filename = f"{secrets.token_hex(4)}_{file.filename}"
     file_path = os.path.join(UPLOAD_DIR, safe_filename)
 
@@ -247,13 +272,12 @@ def upload_file(task_id: str, file: UploadFile = File(...), user: str = Depends(
     download_url = f"https://remindme-backend1.onrender.com/files/{safe_filename}"
     chat_message = f"FILE::{file.filename}::{download_url}"
 
-    if str_id not in COMMENTS:
-        COMMENTS[str_id] = []
-    
-    COMMENTS[str_id].append({
+    payload = {
+        "task_id": task_id,
         "author": user,
         "message": chat_message
-    })
+    }
+    supabase.table("comments").insert(payload).execute()
 
     return {"message": "Datei hochgeladen", "url": download_url}
 
@@ -266,4 +290,4 @@ def download_file(filename: str):
 
 @app.get("/")
 def root():
-    return {"status": "Online", "app": "Remind Me Backend"}
+    return {"status": "Online", "app": "Remind Me Backend mit Supabase"}
