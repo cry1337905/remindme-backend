@@ -67,13 +67,9 @@ class TaskCreateModel(BaseModel):
     description: str
     assignee: str
     deadline: str
-    position: Optional[int] = 0
 
 class TaskStatusModel(BaseModel):
     status: str
-
-class TaskPositionModel(BaseModel):
-    position: int
 
 class CommentModel(BaseModel):
     message: str
@@ -198,6 +194,7 @@ def save_group(data: GroupModel, user: str = Depends(get_current_user)):
     if company_id:
         payload["company_id"] = company_id
 
+    # Upsert (Einfügen oder Aktualisieren, falls Name existiert)
     res = supabase.table("groups").upsert(payload, on_conflict="name").execute()
     return {"message": "Gruppe in Supabase gespeichert", "data": res.data}
 
@@ -208,12 +205,11 @@ def delete_group(name: str, user: str = Depends(get_current_user)):
 
 
 # ---------------------------------------------------------------------------
-# TASKS (SUPABASE INTEGRATION + DRAG & DROP SUPPORT)
+# TASKS (SUPABASE INTEGRATION)
 # ---------------------------------------------------------------------------
 @app.get("/tasks")
 def get_tasks(user: str = Depends(get_current_user)):
-    # Sortierung nach Position für Drag & Drop Reihenfolge
-    res = supabase.table("tasks").select("*").order("position", desc=False).execute()
+    res = supabase.table("tasks").select("*").execute()
     return res.data or []
 
 @app.post("/tasks")
@@ -225,7 +221,6 @@ def create_task(data: TaskCreateModel, user: str = Depends(get_current_user)):
         "assignee": data.assignee,
         "deadline": data.deadline,
         "status": "Offen",
-        "position": data.position,
         "created_by": user
     }
     if company_id:
@@ -242,13 +237,6 @@ def update_task_status(task_id: str, data: TaskStatusModel, user: str = Depends(
         raise HTTPException(status_code=404, detail="Aufgabe nicht gefunden")
     return res.data[0]
 
-@app.patch("/tasks/{task_id}/position")
-def update_task_position(task_id: str, data: TaskPositionModel, user: str = Depends(get_current_user)):
-    res = supabase.table("tasks").update({"position": data.position}).eq("id", task_id).execute()
-    if not res.data:
-        raise HTTPException(status_code=404, detail="Aufgabe nicht gefunden")
-    return {"message": "Position aktualisiert", "data": res.data[0]}
-
 @app.delete("/tasks/{task_id}")
 def delete_task(task_id: str, user: str = Depends(get_current_user)):
     supabase.table("tasks").delete().eq("id", task_id).execute()
@@ -256,7 +244,7 @@ def delete_task(task_id: str, user: str = Depends(get_current_user)):
 
 
 # ---------------------------------------------------------------------------
-# CHAT & DATEI-UPLOAD (DRAG & DROP DATEIEN)
+# CHAT & KOMMENTARE (SUPABASE INTEGRATION)
 # ---------------------------------------------------------------------------
 @app.get("/tasks/{task_id}/comments")
 def get_comments(task_id: str, user: str = Depends(get_current_user)):
@@ -302,4 +290,4 @@ def download_file(filename: str):
 
 @app.get("/")
 def root():
-    return {"status": "Online", "app": "Remind Me Backend mit Supabase & Drag-and-Drop Support"}
+    return {"status": "Online", "app": "Remind Me Backend mit Supabase"}
