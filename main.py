@@ -6,7 +6,6 @@ from fastapi import FastAPI, HTTPException, Depends, Header, UploadFile, File
 from fastapi.responses import FileResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, EmailStr
-import bcrypt
 from supabase import create_client, Client
 
 # ---------------------------------------------------------------------------
@@ -89,17 +88,13 @@ def get_current_user(authorization: Optional[str] = Header(None)) -> str:
 
 
 # ---------------------------------------------------------------------------
-# AUTH ENDPUNKTE (MIT SUPABASE VERNETZT)
+# AUTH ENDPUNKTE (NATIVE SUPABASE AUTHENTIFIZIERUNG)
 # ---------------------------------------------------------------------------
 @app.post("/register")
 def register(data: RegisterModel):
     email = data.email.strip().lower()
 
-    # Prüfen, ob User bereits in Supabase existiert
-    res = supabase.table("users").select("*").eq("email", email).execute()
-    if res.data:
-        raise HTTPException(status_code=400, detail="E-Mail bereits registriert")
-
+    # 1. Firmen-Code prüfen oder neu anlegen
     company_code = data.company_code
     if data.company_name:
         company_code = f"COMP-{secrets.token_hex(2).upper()}"
@@ -109,76 +104,73 @@ def register(data: RegisterModel):
         if not comp_res.data:
             raise HTTPException(status_code=400, detail="Ungültiger Firmen-Code")
 
-    # Passwort mit bcrypt verschlüsseln
-    hashed_pwd = bcrypt.hashpw(data.password.encode('utf-8'), bcrypt.gensalt()).decode('utf-8')
+    # 2. Account über Supabase Auth registrieren
+    try:
+        auth_response = supabase.auth.sign_up({
+            "email": email,
+            "password": data.password,
+            "options": {
+                "data": {
+                    "username": data.username,
+                    "company_code": company_code
+                }
+            }
+        })
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Registrierung fehlgeschlagen: {str(e)}")
 
-    # In Supabase-Tabelle "users" speichern
-    supabase.table("users").insert({
-        "email": email,
-        "username": data.username,
-        "password": hashed_pwd,
-        "company_code": company_code
-    }).execute()
+    # 3. Profil-Daten in eigener `users`-Tabelle absichern/ergänzen
+    user_res = supabase.table("users").select("*").eq("email", email).execute()
+    if not user_res.data:
+        supabase.table("users").insert({
+            "email": email,
+            "username": data.username,
+            "company_id": company_code
+        }).execute()
 
     return {"message": "Erfolgreich registriert", "company_code": company_code}
+
 
 @app.post("/login")
 def login(data: LoginModel):
     email = data.email.strip().lower()
 
-    # User aus Supabase abfragen
-    res = supabase.table("users").select("*").eq("email", email).execute()
-    if not res.data:
-        raise HTTPException(status_code=400, detail="E-Mail oder Passwort falsch")
+    # Login direkt über den Supabase Auth Service
+    try:
+        auth_response = supabase.auth.sign_in_with_password({
+            "email": email,
+            "password": data.password
+        })
+        
+        if not auth_response.user:
+            raise HTTPException(status_code=400, detail="E-Mail oder Passwort falsch")
 
-    user = res.data[0]
-
-    # Passwort-Feld flexibel ermitteln (falls in Supabase 'passwort' statt 'password' steht)
-    db_password = user.get("password") or user.get("passwort") or user.get("pwd") or user.get("hash")
-
-    if not db_password:
-        print(f"[ERROR] Verfügbare Spalten in Supabase-Tabelle 'users': {list(user.keys())}")
-        raise HTTPException(status_code=500, detail="Passwort-Spalte in der Supabase-Datenbank nicht gefunden")
-
-    # Prüft gehashte Passwörter sowie ältere Klartext-Einträge
-    is_valid = False
-    if str(db_password).startswith("$2b$") or str(db_password).startswith("$2a$"):
-        is_valid = bcrypt.checkpw(data.password.encode('utf-8'), db_password.encode('utf-8'))
-    else:
-        is_valid = (db_password == data.password)
-
-    if not is_valid:
+    except Exception:
         raise HTTPException(status_code=400, detail="E-Mail oder Passwort falsch")
 
     token = secrets.token_hex(16)
     TOKENS[token] = email
     return {"access_token": token, "token_type": "bearer"}
 
+
 @app.post("/forgot-password")
 def forgot_password(data: ForgotPasswordModel):
     email = data.email.strip().lower()
-    res = supabase.table("users").select("*").eq("email", email).execute()
-    if not res.data:
-        raise HTTPException(status_code=404, detail="E-Mail nicht gefunden")
+    try:
+        supabase.auth.reset_password_email(email)
+    except Exception:
+        raise HTTPException(status_code=404, detail="E-Mail nicht gefunden oder Fehler beim Senden")
     
-    code = f"{secrets.randbelow(1000000):06d}"
-    supabase.table("reset_codes").upsert({"email": email, "code": code}).execute()
-    print(f"[RESET CODE] Für {email}: {code}")
-    return {"message": "Code gesendet"}
+    return {"message": "Passwort-Zurücksetzen-E-Mail gesendet"}
+
 
 @app.post("/reset-password")
 def reset_password(data: ResetPasswordModel):
-    email = data.email.strip().lower()
-    code_res = supabase.table("reset_codes").select("*").eq("email", email).execute()
-    
-    if not code_res.data or code_res.data[0]["code"] != data.code:
-        raise HTTPException(status_code=400, detail="Ungültiger Code")
-    
-    hashed_pwd = bcrypt.hashpw(data.new_password.encode('utf-8'), bcrypt.gensalt()).decode('utf-8')
-    supabase.table("users").update({"password": hashed_pwd}).eq("email", email).execute()
-    supabase.table("reset_codes").delete().eq("email", email).execute()
-    
-    return {"message": "Passwort geändert"}
+    # Bei Verwendung von Supabase Auth wird das Zurücksetzen standardmäßig über E-Mail-Links abgewickelt
+    raise HTTPException(
+        status_code=400, 
+        detail="Bitte nutze den Link in der E-Mail zum Zurücksetzen des Passworts."
+    )
 
 
 # ---------------------------------------------------------------------------
