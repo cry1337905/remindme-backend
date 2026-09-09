@@ -67,6 +67,7 @@ class TaskCreateModel(BaseModel):
     description: str
     assignee: str
     deadline: str
+    project_name: Optional[str] = None
 
 class TaskStatusModel(BaseModel):
     status: str
@@ -194,7 +195,6 @@ def save_group(data: GroupModel, user: str = Depends(get_current_user)):
     if company_id:
         payload["company_id"] = company_id
 
-    # Upsert (Einfügen oder Aktualisieren, falls Name existiert)
     res = supabase.table("groups").upsert(payload, on_conflict="name").execute()
     return {"message": "Gruppe in Supabase gespeichert", "data": res.data}
 
@@ -220,6 +220,7 @@ def create_task(data: TaskCreateModel, user: str = Depends(get_current_user)):
         "description": data.description,
         "assignee": data.assignee,
         "deadline": data.deadline,
+        "project_name": data.project_name.strip() if data.project_name and data.project_name.strip() else "Ohne Projekt",
         "status": "Offen",
         "created_by": user
     }
@@ -244,7 +245,7 @@ def delete_task(task_id: str, user: str = Depends(get_current_user)):
 
 
 # ---------------------------------------------------------------------------
-# CHAT & KOMMENTARE (SUPABASE INTEGRATION)
+# CHAT & KOMMENTARE & DATEI-UPLOADS
 # ---------------------------------------------------------------------------
 @app.get("/tasks/{task_id}/comments")
 def get_comments(task_id: str, user: str = Depends(get_current_user)):
@@ -285,7 +286,8 @@ def upload_file(task_id: str, file: UploadFile = File(...), user: str = Depends(
 def download_file(filename: str):
     file_path = os.path.join(UPLOAD_DIR, filename)
     if os.path.exists(file_path):
-        return FileResponse(file_path)
+        original_filename = filename.split("_", 1)[-1] if "_" in filename else filename
+        return FileResponse(file_path, filename=original_filename)
     raise HTTPException(status_code=404, detail="Datei nicht gefunden")
 
 @app.get("/")
