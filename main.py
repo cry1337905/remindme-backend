@@ -1,71 +1,26 @@
-import datetime
+import os
 from typing import List, Optional
-from fastapi import FastAPI, Depends, HTTPException, status
-from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
+from fastapi import FastAPI, Depends, HTTPException, Header, status
 from pydantic import BaseModel, EmailStr
-from sqlalchemy import create_engine, Column, Integer, String, DateTime, Text, or_
-from sqlalchemy.ext.declarative import declarative_base
-from sqlalchemy.orm import sessionmaker, Session
-import jwt
-from passlib.context import CryptContext
+from supabase import create_client, Client
 
 # ---------------------------------------------------------------------------
-# KONFIGURATION & DATENBANK-SETUP
+# SUPABASE KONFIGURATION
+# Der Key wird sicher aus den Render-Umgebungsvariablen ausgelesen
 # ---------------------------------------------------------------------------
-SECRET_KEY = "DEIN_GEHEIMER_SCHLUESSEL_HIER_AENDERN"
-ALGORITHM = "HS256"
-ACCESS_TOKEN_EXPIRE_MINUTES = 60 * 24 * 7  # 7 Tage gültig
+SUPABASE_URL = os.getenv("SUPABASE_URL", "https://ligaopexwxgoirrpiuwi.supabase.co")
+SUPABASE_KEY = os.getenv("SUPABASE_KEY")
 
-# Füge hier deine Supabase Connection String ein (oder nutze Umgebungsvariablen)
-DATABASE_URL = "postgresql://postgres:[DEIN-PASSWORT]@db.[DEIN-SUPABASE-REF].supabase.co:5432/postgres"
+if not SUPABASE_KEY:
+    print("HINWEIS: SUPABASE_KEY ist nicht in den Umgebungsvariablen gesetzt!")
 
-engine = create_engine(DATABASE_URL)
-SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
-Base = declarative_base()
-
-pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
-oauth2_scheme = OAuth2PasswordBearer(tokenUrl="login")
+supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY or "DUMMY_KEY")
 
 app = FastAPI(title="Remind Me Backend")
 
 
 # ---------------------------------------------------------------------------
-# DATENBANK MODELLE (SQLAlchemy)
-# ---------------------------------------------------------------------------
-class UserDB(Base):
-    __tablename__ = "users"
-    id = Column(Integer, primary_key=True, index=True)
-    email = Column(String, unique=True, index=True, nullable=False)
-    username = Column(String, nullable=False)
-    hashed_password = Column(String, nullable=False)
-    company_code = Column(String, nullable=True)
-
-
-class TaskDB(Base):
-    __tablename__ = "tasks"
-    id = Column(Integer, primary_key=True, index=True)
-    title = Column(String, nullable=False)
-    description = Column(Text, nullable=True)
-    assignee = Column(String, nullable=True)
-    deadline = Column(String, nullable=True)
-    status = Column(String, default="Offen")
-    project_name = Column(String, default="Ohne Projekt")
-    created_by = Column(String, nullable=False)
-    created_at = Column(DateTime, default=datetime.datetime.utcnow)
-
-
-class GroupDB(Base):
-    __tablename__ = "groups"
-    id = Column(Integer, primary_key=True, index=True)
-    name = Column(String, unique=True, nullable=False)
-    members = Column(Text, nullable=False)  # Kommagetrennte E-Mails/Namen oder JSON
-
-
-Base.metadata.create_all(bind=engine)
-
-
-# ---------------------------------------------------------------------------
-# PYDANTIC SCHEMAS (Eingabe / Ausgabe Validierung)
+# PYDANTIC SCHEMAS
 # ---------------------------------------------------------------------------
 class UserRegister(BaseModel):
     email: EmailStr
@@ -88,182 +43,173 @@ class TaskCreate(BaseModel):
     project_name: Optional[str] = "Ohne Projekt"
 
 
-class TaskResponse(BaseModel):
-    id: int
-    title: str
-    description: Optional[str]
-    assignee: Optional[str]
-    deadline: Optional[str]
-    status: Optional[str]
-    project_name: Optional[str]
-    created_by: str
-
-    class Config:
-        orm_mode = True
-
-
 class GroupCreate(BaseModel):
     name: str
     members: List[str]
 
 
 # ---------------------------------------------------------------------------
-# HELFER-FUNKTIONEN & AUTHENTIFIZIERUNG
+# HELFER-FUNKTION: BENUTZER ÜBER TOKEN ERMITTELN
 # ---------------------------------------------------------------------------
-def get_db():
-    db = SessionLocal()
+def get_current_user_email(authorization: str = Header(None)) -> str:
+    if not authorization or not authorization.startswith("Bearer "):
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Fehlender oder ungültiger Authorization-Header."
+        )
+
+    token = authorization.split(" ")[1]
+    
     try:
-        yield db
-    finally:
-        db.close()
-
-
-def verify_password(plain_password, hashed_password):
-    return pwd_context.verify(plain_password, hashed_password)
-
-
-def get_password_hash(password):
-    return pwd_context.hash(password)
-
-
-def create_access_token(data: dict):
-    to_encode = data.copy()
-    expire = datetime.datetime.utcnow() + datetime.timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
-    to_encode.update({"exp": expire})
-    return jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
-
-
-def get_current_user(token: str = Depends(oauth2_scheme), db: Session = Depends(get_db)):
-    credentials_exception = HTTPException(
-        status_code=status.HTTP_401_UNAUTHORIZED,
-        detail="Token konnte nicht validiert werden",
-        headers={"WWW-Authenticate": "Bearer"},
-    )
-    try:
-        payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
-        email: str = payload.get("sub")
-        if email is None:
-            raise credentials_exception
-    except jwt.PyJWTError:
-        raise credentials_exception
-
-    user = db.query(UserDB).filter(UserDB.email == email).first()
-    if user is None:
-        raise credentials_exception
-    return user
+        user_response = supabase.auth.get_user(token)
+        if not user_response or not user_response.user:
+            raise HTTPException(status_code=401, detail="Ungültiges Token.")
+        return user_response.user.email
+    except Exception as e:
+        raise HTTPException(status_code=401, detail=f"Authentifizierungsfehler: {str(e)}")
 
 
 # ---------------------------------------------------------------------------
-# ENDPUNKTE / ROUTEN
+# AUTHENTIFIZIERUNG ENDPUNKTE
 # ---------------------------------------------------------------------------
-
 @app.post("/register")
-def register(user_data: UserRegister, db: Session = Depends(get_db)):
-    existing_user = db.query(UserDB).filter(UserDB.email == user_data.email).first()
-    if existing_user:
-        raise HTTPException(status_code=400, detail="E-Mail bereits registriert.")
-
-    hashed_pw = get_password_hash(user_data.password)
-    new_user = UserDB(
-        email=user_data.email,
-        username=user_data.username,
-        hashed_password=hashed_pw,
-        company_code=user_data.company_code or "DEFAULT"
-    )
-    db.add(new_user)
-    db.commit()
-    return {"message": "Registrierung erfolgreich!"}
+def register(user_data: UserRegister):
+    try:
+        response = supabase.auth.sign_up({
+            "email": user_data.email,
+            "password": user_data.password,
+            "options": {
+                "data": {
+                    "username": user_data.username,
+                    "company_code": user_data.company_code or "DEFAULT"
+                }
+            }
+        })
+        return {"message": "Registrierung erfolgreich!", "user": response.user}
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
 
 
 @app.post("/login")
-def login(user_data: UserLogin, db: Session = Depends(get_db)):
-    user = db.query(UserDB).filter(UserDB.email == user_data.email).first()
-    if not user or not verify_password(user.password, user.hashed_password):
+def login(user_data: UserLogin):
+    try:
+        response = supabase.auth.sign_in_with_password({
+            "email": user_data.email,
+            "password": user_data.password
+        })
+        return {
+            "access_token": response.session.access_token,
+            "token_type": "bearer",
+            "user": response.user
+        }
+    except Exception as e:
         raise HTTPException(status_code=400, detail="Ungültige E-Mail oder Passwort.")
 
-    access_token = create_access_token(data={"sub": user.email})
-    return {"access_token": access_token, "token_type": "bearer"}
-
 
 # ---------------------------------------------------------------------------
-# GEFILTERTE AUFGABEN-ROUTE (NUR EIGENE UND ZUGEWIESENE AUFGABEN SEHEN)
+# GEFILTERTE AUFGABEN-ROUTEN
 # ---------------------------------------------------------------------------
-@app.get("/tasks", response_model=List[TaskResponse])
-def get_user_tasks(current_user: UserDB = Depends(get_current_user), db: Session = Depends(get_db)):
-    user_email = current_user.email
+@app.get("/tasks")
+def get_user_tasks(user_email: str = Depends(get_current_user_email)):
+    try:
+        # 1. Gruppen abrufen, in denen der Benutzer Mitglied ist
+        groups_response = supabase.table("groups").select("name, members").execute()
+        user_groups = []
+        
+        if groups_response.data:
+            for group in groups_response.data:
+                members = group.get("members", "")
+                if user_email in str(members):
+                    user_groups.append(group["name"])
 
-    # 1. Alle Gruppen abrufen, in denen der angemeldete Benutzer als Mitglied eingetragen ist
-    user_groups = db.query(GroupDB.name).filter(GroupDB.members.contains(user_email)).all()
-    group_names = [g.name for g in user_groups]
+        # 2. Alle Aufgaben aus Supabase laden
+        tasks_response = supabase.table("tasks").select("*").execute()
+        all_tasks = tasks_response.data or []
 
-    # 2. Filter anwenden:
-    # - Der Benutzer ist Ersteller (created_by)
-    # - ODER die E-Mail/Name ist direkt im 'assignee'-Feld enthalten
-    # - ODER eine seiner Gruppen ist als 'assignee' zugewiesen
-    tasks = db.query(TaskDB).filter(
-        or_(
-            TaskDB.created_by == user_email,
-            TaskDB.assignee.contains(user_email),
-            TaskDB.assignee.in_(group_names) if group_names else False
-        )
-    ).all()
+        # 3. Filtern: Ersteller, zugewiesener Benutzer oder Mitglied der zugewiesenen Gruppe
+        filtered_tasks = []
+        for task in all_tasks:
+            created_by = task.get("created_by", "")
+            assignee = task.get("assignee", "")
 
-    return tasks
+            is_creator = created_by == user_email
+            is_assignee = assignee and user_email in assignee
+            is_group_assignee = assignee in user_groups
+
+            if is_creator or is_assignee or is_group_assignee:
+                filtered_tasks.append(task)
+
+        return filtered_tasks
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
 
-@app.post("/tasks", response_model=TaskResponse)
-def create_task(task_data: TaskCreate, current_user: UserDB = Depends(get_current_user), db: Session = Depends(get_db)):
-    new_task = TaskDB(
-        title=task_data.title,
-        description=task_data.description,
-        assignee=task_data.assignee,
-        deadline=task_data.deadline,
-        project_name=task_data.project_name or "Ohne Projekt",
-        created_by=current_user.email
-    )
-    db.add(new_task)
-    db.commit()
-    db.refresh(new_task)
-    return new_task
+@app.post("/tasks")
+def create_task(task_data: TaskCreate, user_email: str = Depends(get_current_user_email)):
+    try:
+        new_task = {
+            "title": task_data.title,
+            "description": task_data.description,
+            "assignee": task_data.assignee,
+            "deadline": task_data.deadline,
+            "project_name": task_data.project_name or "Ohne Projekt",
+            "created_by": user_email,
+            "status": "Offen"
+        }
+        response = supabase.table("tasks").insert(new_task).execute()
+        return response.data[0] if response.data else new_task
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 @app.delete("/tasks/{task_id}")
-def delete_task(task_id: int, current_user: UserDB = Depends(get_current_user), db: Session = Depends(get_db)):
-    task = db.query(TaskDB).filter(TaskDB.id == task_id).first()
-    if not task:
-        raise HTTPException(status_code=404, detail="Aufgabe nicht gefunden.")
+def delete_task(task_id: int, user_email: str = Depends(get_current_user_email)):
+    try:
+        task_response = supabase.table("tasks").select("*").eq("id", task_id).execute()
+        if not task_response.data:
+            raise HTTPException(status_code=404, detail="Aufgabe nicht gefunden.")
 
-    if task.created_by != current_user.email:
-        raise HTTPException(status_code=403, detail="Nur der Ersteller darf diese Aufgabe löschen.")
+        task = task_response.data[0]
+        if task.get("created_by") != user_email:
+            raise HTTPException(status_code=403, detail="Nur der Ersteller darf diese Aufgabe löschen.")
 
-    db.delete(task)
-    db.commit()
-    return {"message": "Aufgabe gelöscht."}
+        supabase.table("tasks").delete().eq("id", task_id).execute()
+        return {"message": "Aufgabe erfolgreich gelöscht."}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 # ---------------------------------------------------------------------------
 # GRUPPEN-ENDPUNKTE
 # ---------------------------------------------------------------------------
 @app.get("/groups")
-def get_groups(current_user: UserDB = Depends(get_current_user), db: Session = Depends(get_db)):
-    groups = db.query(GroupDB).all()
-    result = {}
-    for g in groups:
-        members_list = [m.strip() for m in g.members.split(",") if m.strip()]
-        result[g.name] = members_list
-    return result
+def get_groups(user_email: str = Depends(get_current_user_email)):
+    try:
+        response = supabase.table("groups").select("*").execute()
+        result = {}
+        for g in response.data or []:
+            members_raw = g.get("members", "")
+            if isinstance(members_raw, list):
+                result[g["name"]] = members_raw
+            else:
+                result[g["name"]] = [m.strip() for m in str(members_raw).split(",") if m.strip()]
+        return result
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 @app.post("/groups")
-def save_group(group_data: GroupCreate, current_user: UserDB = Depends(get_current_user), db: Session = Depends(get_db)):
-    existing = db.query(GroupDB).filter(GroupDB.name == group_data.name).first()
-    members_str = ", ".join(group_data.members)
+def save_group(group_data: GroupCreate, user_email: str = Depends(get_current_user_email)):
+    try:
+        existing = supabase.table("groups").select("*").eq("name", group_data.name).execute()
+        members_str = ", ".join(group_data.members)
 
-    if existing:
-        existing.members = members_str
-    else:
-        new_group = GroupDB(name=group_data.name, members=members_str)
-        db.add(new_group)
+        if existing.data:
+            supabase.table("groups").update({"members": members_str}).eq("name", group_data.name).execute()
+        else:
+            supabase.table("groups").insert({"name": group_data.name, "members": members_str}).execute()
 
-    db.commit()
-    return {"message": "Gruppe erfolgreich gespeichert!"}
+        return {"message": "Gruppe erfolgreich gespeichert!"}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
