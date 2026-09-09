@@ -1,17 +1,16 @@
 import os
 from typing import List, Optional
-from fastapi import FastAPI, Depends, HTTPException, Header, status
+from fastapi import FastAPI, Depends, HTTPException, Header, UploadFile, File, Form, status
 from pydantic import BaseModel, EmailStr
 from supabase import create_client, Client
 
 # ---------------------------------------------------------------------------
-# SUPABASE KONFIGURATION (Liest Zugangsdaten aus Umgebungsvariablen)
+# SUPABASE KONFIGURATION
 # ---------------------------------------------------------------------------
 SUPABASE_URL = os.getenv("SUPABASE_URL", "https://ligaopexwxgoirrpiuwi.supabase.co")
 SUPABASE_KEY = os.getenv("SUPABASE_KEY")
 
 if not SUPABASE_KEY:
-    # Fällt auf leeren Wert zurück, damit der App-Start controlled eine verständliche Fehlermeldung ausgibt
     print("WARNUNG: SUPABASE_KEY ist nicht in den Umgebungsvariablen gesetzt!")
 
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY or "DUMMY_KEY")
@@ -43,9 +42,19 @@ class TaskCreate(BaseModel):
     project_name: Optional[str] = "Ohne Projekt"
 
 
+class TaskStatusUpdate(BaseModel):
+    status: str
+
+
 class GroupCreate(BaseModel):
     name: str
     members: List[str]
+
+
+class CommentCreate(BaseModel):
+    text: Optional[str] = None
+    content: Optional[str] = None
+    comment: Optional[str] = None
 
 
 # ---------------------------------------------------------------------------
@@ -107,12 +116,11 @@ def login(user_data: UserLogin):
 
 
 # ---------------------------------------------------------------------------
-# GEFILTERTE AUFGABEN-ROUTEN
+# AUFGABEN-ROUTEN & STATUS-ÄNDERUNGEN
 # ---------------------------------------------------------------------------
 @app.get("/tasks")
 def get_user_tasks(user_email: str = Depends(get_current_user_email)):
     try:
-        # 1. Gruppen abrufen, in denen der Benutzer Mitglied ist
         groups_response = supabase.table("groups").select("name, members").execute()
         user_groups = []
         
@@ -122,11 +130,9 @@ def get_user_tasks(user_email: str = Depends(get_current_user_email)):
                 if user_email in str(members):
                     user_groups.append(group["name"])
 
-        # 2. Alle Aufgaben aus Supabase laden
         tasks_response = supabase.table("tasks").select("*").execute()
         all_tasks = tasks_response.data or []
 
-        # 3. Filtern: Ersteller, zugewiesener Benutzer oder Mitglied der zugewiesenen Gruppe
         filtered_tasks = []
         for task in all_tasks:
             created_by = task.get("created_by", "")
@@ -163,10 +169,32 @@ def create_task(task_data: TaskCreate, user_email: str = Depends(get_current_use
         raise HTTPException(status_code=500, detail=str(e))
 
 
+@app.patch("/tasks/{task_id}/status")
+@app.put("/tasks/{task_id}/status")
+def update_task_status(task_id: str, status_data: TaskStatusUpdate, user_email: str = Depends(get_current_user_email)):
+    try:
+        task_id_str = str(task_id)
+        
+        # 1. Status in Aufgaben-Tabelle aktualisieren
+        response = supabase.table("tasks").update({"status": status_data.status}).eq("id", task_id_str).execute()
+        
+        # 2. System-Nachricht in Chat schreiben
+        status_msg = f"{user_email} hat den Status geändert auf: {status_data.status}"
+        supabase.table("comments").insert({
+            "task_id": task_id_str,
+            "user_email": user_email,
+            "text": status_msg,
+            "is_system_message": True
+        }).execute()
+
+        return response.data
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 @app.delete("/tasks/{task_id}")
 def delete_task(task_id: str, user_email: str = Depends(get_current_user_email)):
     try:
-        # 1. task_id als String abfangen
         task_id_str = str(task_id)
 
         task_response = supabase.table("tasks").select("*").eq("id", task_id_str).execute()
@@ -181,6 +209,73 @@ def delete_task(task_id: str, user_email: str = Depends(get_current_user_email))
         return {"message": "Aufgabe erfolgreich gelöscht."}
     except HTTPException as http_ex:
         raise http_ex
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# ---------------------------------------------------------------------------
+# CHAT / KOMMENTARE ENDPUNKTE
+# ---------------------------------------------------------------------------
+@app.get("/tasks/{task_id}/comments")
+@app.get("/tasks/{task_id}/messages")
+def get_comments(task_id: str, user_email: str = Depends(get_current_user_email)):
+    try:
+        response = supabase.table("comments").select("*").eq("task_id", str(task_id)).order("created_at").execute()
+        return response.data or []
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/tasks/{task_id}/comments")
+@app.post("/tasks/{task_id}/messages")
+def add_comment(task_id: str, comment: CommentCreate, user_email: str = Depends(get_current_user_email)):
+    try:
+        # Erfasse den Nachrichtentext aus verschiedenen möglichen Frontend-Feldern
+        comment_text = comment.text or comment.content or comment.comment or ""
+        
+        new_comment = {
+            "task_id": str(task_id),
+            "user_email": user_email,
+            "text": comment_text,
+            "is_system_message": False
+        }
+        response = supabase.table("comments").insert(new_comment).execute()
+        return response.data[0] if response.data else new_comment
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# ---------------------------------------------------------------------------
+# DATEI-UPLOADS (ATTACHMENTS)
+# ---------------------------------------------------------------------------
+@app.post("/tasks/{task_id}/attachments")
+@app.post("/tasks/{task_id}/upload")
+async def upload_attachment(task_id: str, file: UploadFile = File(...), user_email: str = Depends(get_current_user_email)):
+    try:
+        task_id_str = str(task_id)
+        file_bytes = await file.read()
+        file_path = f"task_{task_id_str}/{file.filename}"
+
+        # Datei in Supabase Storage hochladen
+        try:
+            supabase.storage.from_("attachments").upload(file_path, file_bytes, {"content-type": file.content_type})
+        except Exception:
+            # Falls Datei existiert, überschreiben erzwingen
+            supabase.storage.from_("attachments").remove([file_path])
+            supabase.storage.from_("attachments").upload(file_path, file_bytes, {"content-type": file.content_type})
+        
+        file_url = supabase.storage.from_("attachments").get_public_url(file_path)
+
+        # Chat-Hinweis erstellen
+        supabase.table("comments").insert({
+            "task_id": task_id_str,
+            "user_email": user_email,
+            "text": f"{user_email} hat eine Datei angehängt: {file.filename}",
+            "file_url": file_url,
+            "is_system_message": True
+        }).execute()
+
+        return {"filename": file.filename, "file_url": file_url}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
