@@ -2,6 +2,8 @@ fastapi
 uvicorn
 sqlalchemy
 bcrypt
+passlib[bcrypt]
+pyjwt
 pydantic[email]
 email-validator
 python-multipart
