@@ -17,7 +17,6 @@ supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY or "DUMMY_KEY")
 
 app = FastAPI(title="Remind Me Backend")
 
-# Exakter Bucket-Name aus deinem Supabase Dashboard
 BUCKET_NAME = "task-attachments"
 
 
@@ -55,6 +54,7 @@ class GroupCreate(BaseModel):
 
 
 class CommentCreate(BaseModel):
+    message: Optional[str] = None
     text: Optional[str] = None
     comment_text: Optional[str] = None
     content: Optional[str] = None
@@ -119,7 +119,7 @@ def login(user_data: UserLogin):
 
 
 # ---------------------------------------------------------------------------
-# AUFGABEN-ROUTEN & STATUS-ÄNDERUNGEN (DRAG & DROP)
+# AUFGABEN-ROUTEN & STATUS-ÄNDERUNGEN
 # ---------------------------------------------------------------------------
 @app.get("/tasks")
 def get_user_tasks(user_email: str = Depends(get_current_user_email)):
@@ -175,14 +175,13 @@ def create_task(task_data: TaskCreate, user_email: str = Depends(get_current_use
 @app.patch("/tasks/{task_id}/status")
 @app.put("/tasks/{task_id}/status")
 @app.patch("/tasks/{task_id}")
+@app.put("/tasks/{task_id}")
 def update_task_status(task_id: str, status_data: TaskStatusUpdate, user_email: str = Depends(get_current_user_email)):
     try:
         task_id_str = str(task_id)
         
-        # 1. Status der Aufgabe in Supabase aktualisieren
         response = supabase.table("tasks").update({"status": status_data.status}).eq("id", task_id_str).execute()
         
-        # 2. Systemmeldung im Chat hinterlegen
         status_msg = f"hat den Status geändert auf: {status_data.status}"
         supabase.table("comments").insert({
             "task_id": task_id_str,
@@ -235,7 +234,7 @@ def get_comments(task_id: str, user_email: str = Depends(get_current_user_email)
 @app.post("/tasks/{task_id}/messages")
 def add_comment(task_id: str, comment: CommentCreate, user_email: str = Depends(get_current_user_email)):
     try:
-        msg_text = comment.comment_text or comment.text or comment.content or ""
+        msg_text = comment.message or comment.comment_text or comment.text or comment.content or ""
         
         new_comment = {
             "task_id": str(task_id),
@@ -261,18 +260,15 @@ async def upload_attachment(task_id: str, file: UploadFile = File(...), user_ema
         file_bytes = await file.read()
         file_path = f"task_{task_id_str}/{file.filename}"
 
-        # In Supabase Bucket 'task-attachments' hochladen
         try:
             supabase.storage.from_(BUCKET_NAME).upload(file_path, file_bytes, {"content-type": file.content_type})
         except Exception:
-            # Falls vorhanden, Datei überschreiben
             supabase.storage.from_(BUCKET_NAME).remove([file_path])
             supabase.storage.from_(BUCKET_NAME).upload(file_path, file_bytes, {"content-type": file.content_type})
         
         file_url = supabase.storage.from_(BUCKET_NAME).get_public_url(file_path)
 
-        # Eintrag im Chat mit der Dateireferenz
-        msg_text = f"hat eine Datei angehängt: {file.filename}"
+        msg_text = f"FILE::{file.filename}::{file_url}"
         supabase.table("comments").insert({
             "task_id": task_id_str,
             "user_email": user_email,
