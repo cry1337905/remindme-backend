@@ -5,13 +5,14 @@ from pydantic import BaseModel, EmailStr
 from supabase import create_client, Client
 
 # ---------------------------------------------------------------------------
-# SUPABASE KONFIGURATION (Liest Zugangsdaten sicher aus Umgebungsvariablen)
+# SUPABASE KONFIGURATION (Liest Zugangsdaten aus Umgebungsvariablen)
 # ---------------------------------------------------------------------------
 SUPABASE_URL = os.getenv("SUPABASE_URL", "https://ligaopexwxgoirrpiuwi.supabase.co")
 SUPABASE_KEY = os.getenv("SUPABASE_KEY")
 
 if not SUPABASE_KEY:
-    print("HINWEIS: SUPABASE_KEY ist nicht in den Umgebungsvariablen gesetzt!")
+    # Fällt auf leeren Wert zurück, damit der App-Start controlled eine verständliche Fehlermeldung ausgibt
+    print("WARNUNG: SUPABASE_KEY ist nicht in den Umgebungsvariablen gesetzt!")
 
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY or "DUMMY_KEY")
 
@@ -165,9 +166,9 @@ def create_task(task_data: TaskCreate, user_email: str = Depends(get_current_use
 @app.delete("/tasks/{task_id}")
 def delete_task(task_id: str, user_email: str = Depends(get_current_user_email)):
     try:
+        # 1. task_id als String abfangen
         task_id_str = str(task_id)
 
-        # Prüfen, ob die Aufgabe existiert
         task_response = supabase.table("tasks").select("*").eq("id", task_id_str).execute()
         if not task_response.data:
             raise HTTPException(status_code=404, detail="Aufgabe nicht gefunden.")
@@ -176,7 +177,6 @@ def delete_task(task_id: str, user_email: str = Depends(get_current_user_email))
         if task.get("created_by") != user_email:
             raise HTTPException(status_code=403, detail="Nur der Ersteller darf diese Aufgabe löschen.")
 
-        # Aufgabe löschen
         supabase.table("tasks").delete().eq("id", task_id_str).execute()
         return {"message": "Aufgabe erfolgreich gelöscht."}
     except HTTPException as http_ex:
