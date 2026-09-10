@@ -172,21 +172,10 @@ def update_task_status(task_id: str, status_data: TaskStatusUpdate, user_email: 
         if not existing.data:
             raise HTTPException(status_code=404, detail="Aufgabe nicht gefunden.")
 
-        old_status = existing.data[0].get("status", "Offen")
         new_status = status_data.status
-
         supabase.table("tasks").update({"status": new_status}).eq("id", parsed_id).execute()
 
-        comment_entry = {
-            "task_id": parsed_id,
-            "author": user_email,
-            "message": f"STATUSGEÄNDERT: Von {user_email} von '{old_status}' zu '{new_status}' geändert."
-        }
-        try:
-            supabase.table("comments").insert(comment_entry).execute()
-        except Exception as comment_err:
-            print(f"WARNUNG: Kommentar nach Statusänderung fehlgeschlagen: {comment_err}")
-
+        # Automatischen Backend-Kommentareintrag entfernt, um doppelte Chatmeldungen zu vermeiden!
         return {"message": "Status aktualisiert", "status": new_status}
     except HTTPException as http_ex:
         raise http_ex
@@ -226,10 +215,22 @@ def get_task_comments(task_id: str, user_email: str = Depends(get_current_user_e
         
         cleaned_comments = []
         for c in (response.data or []):
+            raw_ts = c.get("created_at") or c.get("timestamp") or ""
+            formatted_ts = raw_ts
+
+            # Wandelt UTC-ISO-Strings aus Supabase in deutsches Datumsformat um
+            if "T" in str(raw_ts):
+                try:
+                    dt = datetime.datetime.fromisoformat(str(raw_ts).replace("Z", "+00:00"))
+                    local_dt = dt.astimezone()
+                    formatted_ts = local_dt.strftime("%d.%m.%Y %H:%M:%S")
+                except Exception:
+                    formatted_ts = str(raw_ts)
+
             cleaned_comments.append({
                 "author": c.get("author") or c.get("user_email") or "System",
                 "message": c.get("message") or c.get("text") or c.get("content") or "",
-                "timestamp": c.get("created_at") or c.get("timestamp") or ""
+                "timestamp": formatted_ts
             })
         return cleaned_comments
     except Exception as e:
