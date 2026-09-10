@@ -1,6 +1,7 @@
 import os
+import datetime
 from typing import List, Optional
-from fastapi import FastAPI, Depends, HTTPException, Header, status
+from fastapi import FastAPI, Depends, HTTPException, Header, UploadFile, File, status
 from pydantic import BaseModel, EmailStr
 from supabase import create_client, Client
 
@@ -11,7 +12,6 @@ SUPABASE_URL = os.getenv("SUPABASE_URL", "https://ligaopexwxgoirrpiuwi.supabase.
 SUPABASE_KEY = os.getenv("SUPABASE_KEY")
 
 if not SUPABASE_KEY:
-    # Fällt auf leeren Wert zurück, damit der App-Start controlled eine verständliche Fehlermeldung ausgibt
     print("WARNUNG: SUPABASE_KEY ist nicht in den Umgebungsvariablen gesetzt!")
 
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY or "DUMMY_KEY")
@@ -41,6 +41,16 @@ class TaskCreate(BaseModel):
     assignee: Optional[str] = "Unassigned"
     deadline: Optional[str] = ""
     project_name: Optional[str] = "Ohne Projekt"
+
+
+class TaskStatusUpdate(BaseModel):
+    status: str
+
+
+class CommentCreate(BaseModel):
+    message: Optional[str] = None
+    text: Optional[str] = None
+    comment_text: Optional[str] = None
 
 
 class GroupCreate(BaseModel):
@@ -112,7 +122,6 @@ def login(user_data: UserLogin):
 @app.get("/tasks")
 def get_user_tasks(user_email: str = Depends(get_current_user_email)):
     try:
-        # 1. Gruppen abrufen, in denen der Benutzer Mitglied ist
         groups_response = supabase.table("groups").select("name, members").execute()
         user_groups = []
         
@@ -122,11 +131,9 @@ def get_user_tasks(user_email: str = Depends(get_current_user_email)):
                 if user_email in str(members):
                     user_groups.append(group["name"])
 
-        # 2. Alle Aufgaben aus Supabase laden
         tasks_response = supabase.table("tasks").select("*").execute()
         all_tasks = tasks_response.data or []
 
-        # 3. Filtern: Ersteller, zugewiesener Benutzer oder Mitglied der zugewiesenen Gruppe
         filtered_tasks = []
         for task in all_tasks:
             created_by = task.get("created_by", "")
@@ -163,10 +170,41 @@ def create_task(task_data: TaskCreate, user_email: str = Depends(get_current_use
         raise HTTPException(status_code=500, detail=str(e))
 
 
+@app.patch("/tasks/{task_id}/status")
+def update_task_status(task_id: str, status_data: TaskStatusUpdate, user_email: str = Depends(get_current_user_email)):
+    try:
+        task_id_str = str(task_id)
+        existing = supabase.table("tasks").select("*").eq("id", task_id_str).execute()
+        if not existing.data:
+            raise HTTPException(status_code=404, detail="Aufgabe nicht gefunden.")
+
+        old_status = existing.data[0].get("status", "Offen")
+        new_status = status_data.status
+
+        supabase.table("tasks").update({"status": new_status}).eq("id", task_id_str).execute()
+
+        now_str = datetime.datetime.now().strftime("%d.%m.%Y %H:%M")
+        comment_entry = {
+            "task_id": task_id_str,
+            "user_email": user_email,
+            "text": f"📌 Status geändert: {old_status} ➔ {new_status}",
+            "created_at": now_str
+        }
+        try:
+            supabase.table("comments").insert(comment_entry).execute()
+        except Exception:
+            pass
+
+        return {"message": "Status aktualisiert", "status": new_status}
+    except HTTPException as http_ex:
+        raise http_ex
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 @app.delete("/tasks/{task_id}")
 def delete_task(task_id: str, user_email: str = Depends(get_current_user_email)):
     try:
-        # 1. task_id als String abfangen
         task_id_str = str(task_id)
 
         task_response = supabase.table("tasks").select("*").eq("id", task_id_str).execute()
@@ -181,6 +219,70 @@ def delete_task(task_id: str, user_email: str = Depends(get_current_user_email))
         return {"message": "Aufgabe erfolgreich gelöscht."}
     except HTTPException as http_ex:
         raise http_ex
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# ---------------------------------------------------------------------------
+# CHAT & KOMMENTAR ENDPUNKTE
+# ---------------------------------------------------------------------------
+@app.get("/tasks/{task_id}/comments")
+def get_task_comments(task_id: str, user_email: str = Depends(get_current_user_email)):
+    try:
+        task_id_str = str(task_id)
+        response = supabase.table("comments").select("*").eq("task_id", task_id_str).execute()
+        return response.data or []
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/tasks/{task_id}/comments")
+def add_task_comment(task_id: str, comment_data: CommentCreate, user_email: str = Depends(get_current_user_email)):
+    try:
+        task_id_str = str(task_id)
+        msg = comment_data.message or comment_data.text or comment_data.comment_text or ""
+        now_str = datetime.datetime.now().strftime("%d.%m.%Y %H:%M")
+
+        new_comment = {
+            "task_id": task_id_str,
+            "user_email": user_email,
+            "text": msg,
+            "created_at": now_str
+        }
+        response = supabase.table("comments").insert(new_comment).execute()
+        return response.data[0] if response.data else new_comment
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/tasks/{task_id}/attachments")
+async def upload_attachment(task_id: str, file: UploadFile = File(...), user_email: str = Depends(get_current_user_email)):
+    try:
+        task_id_str = str(task_id)
+        file_bytes = await file.read()
+        file_name = file.filename
+        file_path = f"tasks/{task_id_str}/{file_name}"
+
+        file_url = None
+        try:
+            supabase.storage.from_("attachments").upload(file_path, file_bytes)
+            file_url = supabase.storage.from_("attachments").get_public_url(file_path)
+        except Exception:
+            file_url = f"file://{file_name}"
+
+        now_str = datetime.datetime.now().strftime("%d.%m.%Y %H:%M")
+        formatted_msg = f"FILE::{file_name}::{file_url}"
+
+        new_comment = {
+            "task_id": task_id_str,
+            "user_email": user_email,
+            "text": formatted_msg,
+            "file_url": file_url,
+            "created_at": now_str
+        }
+        supabase.table("comments").insert(new_comment).execute()
+
+        return {"message": "Datei erfolgreich hochgeladen", "file_url": file_url}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
