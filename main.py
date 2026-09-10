@@ -1,5 +1,6 @@
 import os
 import datetime
+import traceback
 from typing import List, Optional
 from fastapi import FastAPI, Depends, HTTPException, Header, UploadFile, File, status
 from pydantic import BaseModel, EmailStr
@@ -42,6 +43,7 @@ class TaskStatusUpdate(BaseModel):
 class CommentCreate(BaseModel):
     message: Optional[str] = None
     text: Optional[str] = None
+    content: Optional[str] = None
     author: Optional[str] = None
 
 class GroupCreate(BaseModel):
@@ -49,13 +51,11 @@ class GroupCreate(BaseModel):
     members: List[str]
 
 # ---------------------------------------------------------------------------
-# HELFER: SCHAFFT FORMATAUSGLEICH BEI TASK_ID (INT ODER STR)
+# HELFER: TYP-KONVERTIERUNG FÜR TASK_ID
 # ---------------------------------------------------------------------------
 def parse_id(val: str):
-    try:
-        return int(val)
-    except ValueError:
-        return val
+    """Gibt die ID als sauberen String zurück, damit Supabase UUIDs korrekt verarbeitet."""
+    return str(val).strip()
 
 def get_current_user_email(authorization: str = Header(None)) -> str:
     if not authorization or not authorization.startswith("Bearer "):
@@ -142,6 +142,7 @@ def get_user_tasks(user_email: str = Depends(get_current_user_email)):
         return filtered_tasks
 
     except Exception as e:
+        print(f"FEHLER GET TASKS: {traceback.format_exc()}")
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.post("/tasks")
@@ -159,6 +160,7 @@ def create_task(task_data: TaskCreate, user_email: str = Depends(get_current_use
         response = supabase.table("tasks").insert(new_task).execute()
         return response.data[0] if response.data else new_task
     except Exception as e:
+        print(f"FEHLER CREATE TASK: {traceback.format_exc()}")
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.patch("/tasks/{task_id}/status")
@@ -184,13 +186,14 @@ def update_task_status(task_id: str, status_data: TaskStatusUpdate, user_email: 
         }
         try:
             supabase.table("comments").insert(comment_entry).execute()
-        except Exception:
-            pass
+        except Exception as comment_err:
+            print(f"WARNUNG: Kommentar nach Statusänderung fehlgeschlagen: {comment_err}")
 
         return {"message": "Status aktualisiert", "status": new_status}
     except HTTPException as http_ex:
         raise http_ex
     except Exception as e:
+        print(f"FEHLER UPDATE TASK STATUS: {traceback.format_exc()}")
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.delete("/tasks/{task_id}")
@@ -211,6 +214,7 @@ def delete_task(task_id: str, user_email: str = Depends(get_current_user_email))
     except HTTPException as http_ex:
         raise http_ex
     except Exception as e:
+        print(f"FEHLER DELETE TASK: {traceback.format_exc()}")
         raise HTTPException(status_code=500, detail=str(e))
 
 # ---------------------------------------------------------------------------
@@ -222,23 +226,27 @@ def get_task_comments(task_id: str, user_email: str = Depends(get_current_user_e
         parsed_id = parse_id(task_id)
         response = supabase.table("comments").select("*").eq("task_id", parsed_id).execute()
         
-        # Einheitliches Format sichern
         cleaned_comments = []
         for c in (response.data or []):
             cleaned_comments.append({
                 "author": c.get("author") or c.get("user_email") or "System",
-                "message": c.get("message") or c.get("text") or "",
+                "message": c.get("message") or c.get("text") or c.get("content") or "",
                 "timestamp": c.get("timestamp") or c.get("created_at") or ""
             })
         return cleaned_comments
     except Exception as e:
+        print(f"FEHLER GET COMMENTS: {traceback.format_exc()}")
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.post("/tasks/{task_id}/comments")
 def add_task_comment(task_id: str, comment_data: CommentCreate, user_email: str = Depends(get_current_user_email)):
     try:
         parsed_id = parse_id(task_id)
-        msg = comment_data.message or comment_data.text or ""
+        
+        msg = comment_data.message or comment_data.text or comment_data.content or ""
+        if not msg.strip():
+            raise HTTPException(status_code=400, detail="Nachricht darf nicht leer sein.")
+
         now_str = datetime.datetime.now().strftime("%H:%M:%S")
 
         new_comment = {
@@ -247,10 +255,15 @@ def add_task_comment(task_id: str, comment_data: CommentCreate, user_email: str 
             "message": msg,
             "timestamp": now_str
         }
+        
         response = supabase.table("comments").insert(new_comment).execute()
         return response.data[0] if response.data else new_comment
+
+    except HTTPException as http_ex:
+        raise http_ex
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        print(f"FEHLER ADD COMMENT: {traceback.format_exc()}")
+        raise HTTPException(status_code=500, detail=f"Fehler beim Speichern des Kommentars: {str(e)}")
 
 @app.post("/tasks/{task_id}/upload")
 @app.post("/tasks/{task_id}/attachments")
@@ -265,11 +278,12 @@ async def upload_attachment(task_id: str, file: UploadFile = File(...), user_ema
         try:
             supabase.storage.from_("attachments").upload(file_path, file_bytes)
             file_url = supabase.storage.from_("attachments").get_public_url(file_path)
-        except Exception:
-            pass
+        except Exception as storage_err:
+            print(f"WARNUNG: Storage Upload fehlgeschlagen: {storage_err}")
 
         return {"message": "Datei erfolgreich hochgeladen", "url": file_url, "file_url": file_url}
     except Exception as e:
+        print(f"FEHLER UPLOAD ATTACHMENT: {traceback.format_exc()}")
         raise HTTPException(status_code=500, detail=str(e))
 
 # ---------------------------------------------------------------------------
@@ -288,6 +302,7 @@ def get_groups(user_email: str = Depends(get_current_user_email)):
                 result[g["name"]] = [m.strip() for m in str(members_raw).split(",") if m.strip()]
         return result
     except Exception as e:
+        print(f"FEHLER GET GROUPS: {traceback.format_exc()}")
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.post("/groups")
@@ -303,4 +318,5 @@ def save_group(group_data: GroupCreate, user_email: str = Depends(get_current_us
 
         return {"message": "Gruppe erfolgreich gespeichert!"}
     except Exception as e:
+        print(f"FEHLER SAVE GROUP: {traceback.format_exc()}")
         raise HTTPException(status_code=500, detail=str(e))
