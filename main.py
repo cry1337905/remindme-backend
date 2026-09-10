@@ -51,7 +51,7 @@ class GroupCreate(BaseModel):
     members: List[str]
 
 # ---------------------------------------------------------------------------
-# HELFER: TYP-KONVERTIERUNG FÜR TASK_ID
+# HELFER: TYP-KONVERTIERUNG FÜR TASK_ID & AUTH
 # ---------------------------------------------------------------------------
 def parse_id(val: str):
     """Gibt die ID als sauberen String zurück, damit Supabase UUIDs korrekt verarbeitet."""
@@ -177,12 +177,10 @@ def update_task_status(task_id: str, status_data: TaskStatusUpdate, user_email: 
 
         supabase.table("tasks").update({"status": new_status}).eq("id", parsed_id).execute()
 
-        now_str = datetime.datetime.now().strftime("%H:%M:%S")
         comment_entry = {
             "task_id": parsed_id,
             "author": user_email,
-            "message": f"STATUSGEÄNDERT: Von {user_email} von '{old_status}' zu '{new_status}' geändert.",
-            "timestamp": now_str
+            "message": f"STATUSGEÄNDERT: Von {user_email} von '{old_status}' zu '{new_status}' geändert."
         }
         try:
             supabase.table("comments").insert(comment_entry).execute()
@@ -231,7 +229,7 @@ def get_task_comments(task_id: str, user_email: str = Depends(get_current_user_e
             cleaned_comments.append({
                 "author": c.get("author") or c.get("user_email") or "System",
                 "message": c.get("message") or c.get("text") or c.get("content") or "",
-                "timestamp": c.get("timestamp") or c.get("created_at") or ""
+                "timestamp": c.get("created_at") or c.get("timestamp") or ""
             })
         return cleaned_comments
     except Exception as e:
@@ -247,13 +245,10 @@ def add_task_comment(task_id: str, comment_data: CommentCreate, user_email: str 
         if not msg.strip():
             raise HTTPException(status_code=400, detail="Nachricht darf nicht leer sein.")
 
-        now_str = datetime.datetime.now().strftime("%H:%M:%S")
-
         new_comment = {
             "task_id": parsed_id,
             "author": comment_data.author or user_email,
-            "message": msg,
-            "timestamp": now_str
+            "message": msg
         }
         
         response = supabase.table("comments").insert(new_comment).execute()
