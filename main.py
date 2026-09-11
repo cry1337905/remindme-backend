@@ -1,6 +1,7 @@
 import os
 import datetime
 import traceback
+import urllib.parse
 from typing import List, Optional
 from fastapi import FastAPI, Depends, HTTPException, Header, UploadFile, File, status
 from pydantic import BaseModel, EmailStr
@@ -316,3 +317,35 @@ def save_group(group_data: GroupCreate, user_email: str = Depends(get_current_us
     except Exception as e:
         print(f"FEHLER SAVE GROUP: {traceback.format_exc()}")
         raise HTTPException(status_code=500, detail=str(e))
+
+@app.delete("/groups/{group_name}")
+def delete_group(group_name: str, user_email: str = Depends(get_current_user_email)):
+    try:
+        # Dekodierung von URL-Zeichen (z.B. Sch%C3%B6ningen -> Schöningen)
+        decoded_name = urllib.parse.unquote(group_name)
+
+        # 1. Ermitteln der company_id des aktuellen Benutzers
+        user_company_id = None
+        user_res = supabase.table("users").select("company_id").eq("email", user_email).execute()
+        if user_res.data:
+            user_company_id = user_res.data[0].get("company_id")
+
+        # 2. Query aufbauen: Nach Name filtern
+        query = supabase.table("groups").delete().eq("name", decoded_name)
+
+        # 3. Firmenzugehörigkeit berücksichtigen
+        if user_company_id:
+            query = query.eq("company_id", user_company_id)
+        else:
+            query = query.is_("company_id", "null")
+
+        res = query.execute()
+
+        # Falls mit der spezifischen company_id nichts gelöscht wurde (Fallback für alt-erstellte Gruppen)
+        if not res.data:
+            res = supabase.table("groups").delete().eq("name", decoded_name).execute()
+
+        return {"message": f"Gruppe '{decoded_name}' erfolgreich gelöscht.", "deleted": res.data}
+    except Exception as e:
+        print(f"FEHLER DELETE GROUP: {traceback.format_exc()}")
+        raise HTTPException(status_code=500, detail=f"Fehler beim Löschen der Gruppe: {str(e)}")
